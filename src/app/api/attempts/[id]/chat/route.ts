@@ -8,19 +8,14 @@ import {
   DELEGATION_REFUSAL,
   PROMPT_ATTACK_REFUSAL,
   classifyCandidateIntent,
+  findMatchingAction,
 } from "@/lib/ai/classifier";
 import {
-  buildStaticResponse,
   formatReferenceResponse,
   resolveResponseType,
-  selectEvidenceForAction,
 } from "@/lib/ai/simulation";
+import { generateGroundedSimulationResponse } from "@/lib/ai/grounded-simulation";
 import { validateClassifiedAction } from "@/lib/ai/validate-action";
-import {
-  formatDeterministicEvidence,
-  formatDeterministicDialogue,
-  inferEvidenceFormat,
-} from "@/lib/ai/format-evidence";
 import { TurnStructuredRecord } from "@/lib/ai/types";
 import { createPolicyViolationStreamResponse } from "@/lib/ai/cheat-detection";
 import { ModelCallLimitError } from "@/lib/ai/provider-calls";
@@ -453,91 +448,92 @@ export async function POST(
       });
     }
 
-    const rawClassification = await classifyCandidateIntent(model, content, message.trim(), {
+    const classification = await classifyCandidateIntent(model, content, message.trim(), {
       attemptId,
       correlationId: turnId,
     });
-    const validated = validateClassifiedAction(content, rawClassification, message.trim());
-    const classification = validated.classification;
-    const responseType = resolveResponseType({ ...classification, decision: validated.decision });
+    // Optional tagging for scoring analytics — never gates the simulation response.
+    const tagging = validateClassifiedAction(content, classification, message.trim());
+    const matchedActionId =
+      tagging.approvedActionId ??
+      classification.matchedActionId ??
+      findMatchingAction(content, message.trim());
 
     let evidenceIds: string[] = [];
     let responseText: string | null = null;
+    let responseType = resolveResponseType(classification);
     let dialogueFallback = false;
     let dialogueDeterministic = false;
+    let interactionType: string | null = null;
+    let stateChanges: Array<{ key: string; value: string }> = [];
 
-    if (validated.decision === "VALID_ACTION" && validated.approvedActionId) {
-      const matched = content.actions.find((a) => a.id === validated.approvedActionId)!;
-      const selected = selectEvidenceForAction(content, matched.id);
-      evidenceIds = selected.evidenceIds;
-
-      const revealed = [
-        ...new Set([...parseRevealedEvidenceIds(attempt.revealedEvidenceIds), ...evidenceIds]),
-      ];
-      await prisma.attempt.update({
-        where: { id: attemptId },
-        data: { revealedEvidenceIds: revealed },
-      });
-
-      const format = inferEvidenceFormat(matched.category, matched.label);
-      if (format === "dialogue") {
-        const dialogue = formatDeterministicDialogue(selected.evidence);
-        responseText = dialogue.text;
-        dialogueFallback = dialogue.usedFallback;
-        dialogueDeterministic = dialogue.deterministic;
-      } else {
-        responseText = formatDeterministicEvidence(
-          selected.evidence,
-          format,
-          classification.target,
-        );
-      }
-    } else if (validated.decision === "REFERENCE_QUESTION") {
-      responseText = await formatReferenceResponse(model, message.trim(), attemptId);
-    } else if (validated.clarification) {
-      responseText = validated.clarification;
-    } else if (validated.decision === "DELEGATION_REQUEST") {
-      responseText = DELEGATION_REFUSAL;
-    } else if (validated.decision === "ANSWER_SEEKING") {
-      responseText = ANSWER_SEEKING_REFUSAL;
-    } else if (validated.decision === "META_OR_PROMPT_ATTACK") {
+    if (classification.decision === "META_OR_PROMPT_ATTACK") {
       responseText = PROMPT_ATTACK_REFUSAL;
+      responseType = "prompt_attack_refusal";
+    } else if (classification.decision === "DELEGATION_REQUEST") {
+      responseText = DELEGATION_REFUSAL;
+      responseType = "delegation_refusal";
+    } else if (classification.decision === "ANSWER_SEEKING") {
+      responseText = ANSWER_SEEKING_REFUSAL;
+      responseType = "answer_seeking_refusal";
+    } else if (classification.decision === "REFERENCE_QUESTION") {
+      responseText = await formatReferenceResponse(model, message.trim(), attemptId);
+      responseType = "reference_answer";
     } else {
-      responseText = buildStaticResponse({ ...classification, decision: validated.decision });
-    }
-
-    if (validated.validationFailed) {
-      await prisma.attemptEvent.create({
-        data: {
-          attemptId,
-          type: "action_validation_failed",
-          payload: {
-            turnId,
-            candidateMessageId: userMessage.id,
-            reason: validated.validationReason,
-            classifierDecision: rawClassification.decision,
-            matchedActionId: rawClassification.matchedActionId,
-          },
-        },
+      const simulationResult = await generateGroundedSimulationResponse({
+        model,
+        attemptId,
+        content,
+        candidateMessage: message.trim(),
+        transcript: attempt.messages.map((m) => ({
+          id: m.id,
+          role: m.role,
+          content: m.content,
+        })),
+        correlationId: turnId,
       });
+
+      responseText = simulationResult.responseText;
+      evidenceIds = simulationResult.disclosedFactIds;
+      interactionType = simulationResult.interactionType;
+      stateChanges = simulationResult.stateChanges;
+      dialogueFallback = simulationResult.usedFallback;
+      dialogueDeterministic = false;
+      responseType = simulationResult.clarificationNeeded
+        ? "clarification"
+        : "simulation_response";
+
+      if (evidenceIds.length > 0) {
+        const revealed = [
+          ...new Set([...parseRevealedEvidenceIds(attempt.revealedEvidenceIds), ...evidenceIds]),
+        ];
+        await prisma.attempt.update({
+          where: { id: attemptId },
+          data: { revealedEvidenceIds: revealed },
+        });
+      }
     }
 
     if (!responseText) {
-      responseText = "That action is not available in this environment.";
+      responseText =
+        "The simulation could not produce a clear result for that request. Try a more specific interaction.";
     }
 
     const turnRecord: TurnStructuredRecord = {
       candidateMessageId: userMessage.id,
-      classificationDecision: validated.decision,
+      classificationDecision: classification.decision,
       targetType: classification.targetType,
       target: classification.target,
       methodOrTool: classification.methodOrTool,
       requestedAction: classification.requestedAction,
       parameters: classification.parameters,
-      matchedActionId: validated.approvedActionId,
+      matchedActionId,
       missingFields: classification.missingFields,
       responseType,
       evidenceIds,
+      disclosedFactIds: evidenceIds,
+      interactionType,
+      stateChanges,
       classifierModel: modelLabel,
       responderModel: modelLabel,
     };
@@ -554,15 +550,25 @@ export async function POST(
       data: {
         attemptId,
         type: "turn_classified",
-        payload: { ...turnRecord, turnId, dialogueFallback, dialogueDeterministic } as object,
+        payload: {
+          ...turnRecord,
+          turnId,
+          dialogueFallback,
+          dialogueDeterministic,
+          actionTagging: {
+            approvedActionId: tagging.approvedActionId,
+            validationFailed: tagging.validationFailed,
+            validationReason: tagging.validationReason,
+          },
+        } as object,
       },
     });
 
-    await recordPolicyViolationIfNeeded(attemptId, turnId, userMessage.id, validated.decision);
+    await recordPolicyViolationIfNeeded(attemptId, turnId, userMessage.id, classification.decision);
 
     const persisted = await persistTurnAssistant(attemptId, turnId, responseText, {
       responseType,
-      classificationDecision: validated.decision,
+      classificationDecision: classification.decision,
       dialogueFallback,
       dialogueDeterministic,
       turnId,

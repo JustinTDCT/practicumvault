@@ -69,7 +69,15 @@ export default function TemplateEditorPage() {
       ...content,
       environment: {
         ...content.environment,
-        hiddenFacts: content.environment.hiddenFacts.map((f) => f.trim()).filter(Boolean),
+        hiddenFacts: content.environment.hiddenFacts
+          .map((f) => ({
+            ...f,
+            id: f.id.trim(),
+            fact: f.fact.trim(),
+            sources: f.sources.map((s) => s.trim()).filter(Boolean),
+            revealWhen: f.revealWhen.map((s) => s.trim()).filter(Boolean),
+          }))
+          .filter((f) => f.id && f.fact),
         redHerrings: content.environment.redHerrings.map((f) => f.trim()).filter(Boolean),
       },
     };
@@ -103,7 +111,7 @@ export default function TemplateEditorPage() {
   const updateStarting = (field: string, value: string) =>
     setContent({ ...content, startingSituation: { ...content.startingSituation, [field]: value } });
 
-  const updateEnv = (field: string, value: string | string[]) =>
+  const updateEnv = (field: string, value: unknown) =>
     setContent({ ...content, environment: { ...content.environment, [field]: value } });
 
   return (
@@ -122,13 +130,12 @@ export default function TemplateEditorPage() {
           </p>
         </div>
 
-        {!specificity.ok && (
+        {specificity.issues.length > 0 && (
           <div className="alert" style={{ marginBottom: 16, borderColor: "var(--warning)" }}>
-            <strong>Action specificity review required.</strong>
+            <strong>Optional action metadata warnings</strong>
             <p style={{ margin: "8px 0 0", color: "var(--text-muted)" }}>
-              {status === "PUBLISHED"
-                ? "This published scenario can still be edited, but new assignments are blocked until every action’s specificity requirements are reviewed."
-                : "Publishing is blocked until every action’s specificity requirements are reviewed."}
+              Predefined actions are optional scoring/authoring hints. The simulation can respond
+              without them. Review these when you use actions as expected pathways.
             </p>
             <ul style={{ margin: "8px 0 0", paddingLeft: 18 }}>
               {specificity.issues.map((issue) => (
@@ -206,16 +213,123 @@ export default function TemplateEditorPage() {
             <label>Root cause (hidden)</label>
             <textarea value={content.environment.rootCause} onChange={(e) => updateEnv("rootCause", e.target.value)} disabled={status === "DISABLED"} />
           </div>
-          <StringListEditor
-            label="Hidden facts"
-            description="Ground truth the simulation uses for command output (IPs, DNS servers, hostnames, etc.). Never shown directly to the candidate."
-            items={content.environment.hiddenFacts}
-            onChange={(hiddenFacts) => updateEnv("hiddenFacts", hiddenFacts)}
-            placeholder="e.g. Client DNS servers: 192.168.1.1, 8.8.8.8"
-            disabled={status === "DISABLED"}
-            addLabel="Add fact"
-            itemLabel="Fact"
-          />
+          <div className="form-group">
+            <label>Hidden facts</label>
+            <p style={{ color: "var(--text-muted)", fontSize: 14, margin: "0 0 8px" }}>
+              Ground truth the simulation may disclose when the candidate’s interaction would
+              realistically reveal it. Candidates never see fact IDs.
+            </p>
+            {content.environment.hiddenFacts.map((fact, i) => (
+              <div key={`${fact.id}-${i}`} className="card-section">
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <span style={{ color: "var(--text-faint)", fontSize: "0.8125rem", fontWeight: 600 }}>
+                    Fact {i + 1}
+                  </span>
+                  {status !== "DISABLED" && (
+                    <button
+                      className="btn btn-danger btn-sm"
+                      type="button"
+                      onClick={() =>
+                        updateEnv(
+                          "hiddenFacts",
+                          content.environment.hiddenFacts.filter((_, idx) => idx !== i),
+                        )
+                      }
+                    >
+                      Remove
+                    </button>
+                  )}
+                </div>
+                <label style={{ display: "block", fontSize: 13, marginBottom: 8 }}>
+                  ID
+                  <input
+                    value={fact.id}
+                    disabled={status === "DISABLED"}
+                    onChange={(e) => {
+                      const hiddenFacts = [...content.environment.hiddenFacts];
+                      hiddenFacts[i] = { ...fact, id: e.target.value };
+                      updateEnv("hiddenFacts", hiddenFacts);
+                    }}
+                    placeholder="fact-user-other-sites-work"
+                    style={{ display: "block", width: "100%", marginTop: 4 }}
+                  />
+                </label>
+                <label style={{ display: "block", fontSize: 13, marginBottom: 8 }}>
+                  Fact text
+                  <textarea
+                    value={fact.fact}
+                    disabled={status === "DISABLED"}
+                    onChange={(e) => {
+                      const hiddenFacts = [...content.environment.hiddenFacts];
+                      hiddenFacts[i] = { ...fact, fact: e.target.value };
+                      updateEnv("hiddenFacts", hiddenFacts);
+                    }}
+                    placeholder="The user can access other websites."
+                    style={{ display: "block", width: "100%", marginTop: 4 }}
+                  />
+                </label>
+                <label style={{ display: "block", fontSize: 13, marginBottom: 8 }}>
+                  Sources (comma-separated)
+                  <input
+                    value={fact.sources.join(", ")}
+                    disabled={status === "DISABLED"}
+                    onChange={(e) => {
+                      const hiddenFacts = [...content.environment.hiddenFacts];
+                      hiddenFacts[i] = {
+                        ...fact,
+                        sources: e.target.value
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean),
+                      };
+                      updateEnv("hiddenFacts", hiddenFacts);
+                    }}
+                    placeholder="user, dns"
+                    style={{ display: "block", width: "100%", marginTop: 4 }}
+                  />
+                </label>
+                <label style={{ display: "block", fontSize: 13 }}>
+                  Reveal when (comma-separated guidance)
+                  <input
+                    value={fact.revealWhen.join(", ")}
+                    disabled={status === "DISABLED"}
+                    onChange={(e) => {
+                      const hiddenFacts = [...content.environment.hiddenFacts];
+                      hiddenFacts[i] = {
+                        ...fact,
+                        revealWhen: e.target.value
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean),
+                      };
+                      updateEnv("hiddenFacts", hiddenFacts);
+                    }}
+                    placeholder="Candidate asks whether other websites work"
+                    style={{ display: "block", width: "100%", marginTop: 4 }}
+                  />
+                </label>
+              </div>
+            ))}
+            {status !== "DISABLED" && (
+              <button
+                className="btn btn-secondary"
+                type="button"
+                onClick={() =>
+                  updateEnv("hiddenFacts", [
+                    ...content.environment.hiddenFacts,
+                    {
+                      id: `fact-${content.environment.hiddenFacts.length + 1}`,
+                      fact: "",
+                      sources: [],
+                      revealWhen: [],
+                    },
+                  ])
+                }
+              >
+                Add fact
+              </button>
+            )}
+          </div>
           <StringListEditor
             label="Red herrings"
             description="Plausible distractors — may appear in dead-end paths or misleading output, but are not the root cause."
@@ -349,10 +463,11 @@ export default function TemplateEditorPage() {
         </div>
 
         <div className="card" style={{ marginBottom: 16 }}>
-          <h3>Actions</h3>
+          <h3>Actions (optional)</h3>
           <p style={{ color: "var(--text-muted)", fontSize: 14 }}>
-            Predefined diagnostic actions and their results. For each action, set specificity rules so
-            candidates must name a real system, tool, or contact before evidence is revealed.
+            Optional authored pathways and expected results for scoring hints and regression tests.
+            Candidates can interact in natural language without matching these; the AI simulation
+            responds from hidden facts and scenario state.
           </p>
           {content.actions.map((action, i) => {
             const req = action.requirements ?? getDefaultActionRequirements();

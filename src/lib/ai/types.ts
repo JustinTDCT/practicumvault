@@ -52,6 +52,7 @@ export type IntentClassification = z.infer<typeof intentClassificationSchema>;
 
 export type TurnResponseType =
   | "simulation_evidence"
+  | "simulation_response"
   | "clarification"
   | "delegation_refusal"
   | "answer_seeking_refusal"
@@ -72,7 +73,11 @@ export interface TurnStructuredRecord {
   matchedActionId: string | null;
   missingFields: string[];
   responseType: TurnResponseType;
+  /** Disclosed scenario fact IDs (not action IDs). */
   evidenceIds: string[];
+  disclosedFactIds?: string[];
+  interactionType?: string | null;
+  stateChanges?: Array<{ key: string; value: string }>;
   classifierModel: string;
   responderModel: string;
 }

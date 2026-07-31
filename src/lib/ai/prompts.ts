@@ -198,7 +198,7 @@ Subject: ${content.startingSituation.ticketSubject}
 ### Hidden environment (NEVER disclose directly)
 Root cause: ${content.environment.rootCause}
 Hidden facts:
-${content.environment.hiddenFacts.map((f) => `- ${f}`).join("\n") || "- none"}
+${content.environment.hiddenFacts.map((f) => `- [${f.id}] ${f.fact}`).join("\n") || "- none"}
 Architecture: ${content.environment.architectureNotes}
 Red herrings (distractors only — not the root cause; use on wrong paths if candidate pursues them):
 ${content.environment.redHerrings.map((r) => `- ${r}`).join("\n") || "- none"}

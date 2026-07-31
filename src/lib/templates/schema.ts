@@ -96,6 +96,15 @@ export const objectiveSchema = z.object({
 /** @deprecated Use objectiveSchema — kept for type re-exports only */
 export const gateSchema = objectiveSchema;
 
+export const hiddenFactSchema = z.object({
+  id: z.string().min(1),
+  fact: z.string().min(1),
+  sources: z.array(z.string()).default([]),
+  revealWhen: z.array(z.string()).default([]),
+});
+
+export type HiddenFact = z.infer<typeof hiddenFactSchema>;
+
 const scenarioTemplateContentBaseSchema = z.object({
   metadata: z.object({
     title: z.string().min(1),
@@ -115,7 +124,7 @@ const scenarioTemplateContentBaseSchema = z.object({
   }),
   environment: z.object({
     rootCause: z.string().min(1),
-    hiddenFacts: z.array(z.string()).default([]),
+    hiddenFacts: z.array(hiddenFactSchema).default([]),
     architectureNotes: z.string().default(""),
     redHerrings: z.array(z.string()).default([]),
   }),
@@ -145,6 +154,17 @@ export type ActionDefinition = z.infer<typeof actionSchema>;
 
 export function validateTemplateContent(content: unknown): ScenarioTemplateContent {
   return scenarioTemplateContentSchema.parse(content) as ScenarioTemplateContent;
+}
+
+export function listHiddenFactIds(content: ScenarioTemplateContent): string[] {
+  return content.environment.hiddenFacts.map((f) => f.id);
+}
+
+export function getHiddenFactById(
+  content: ScenarioTemplateContent,
+  id: string,
+): HiddenFact | null {
+  return content.environment.hiddenFacts.find((f) => f.id === id) ?? null;
 }
 
 export function defaultTargetTypeForCategory(category: ActionCategory): ActionTargetType {
@@ -218,8 +238,10 @@ export function canPublishTemplateContent(content: ScenarioTemplateContent): {
   ok: boolean;
   issues: string[];
 } {
+  // Actions are optional authoring/scoring metadata — not a publish gate.
+  // Surface specificity issues as warnings only when actions exist.
   const issues = getActionSpecificityIssues(content);
-  return { ok: issues.length === 0, issues };
+  return { ok: true, issues };
 }
 
 export function getDefaultTemplateContent(title: string): ScenarioTemplateContent {

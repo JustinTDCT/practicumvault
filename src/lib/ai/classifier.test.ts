@@ -11,7 +11,7 @@ import {
   normalizeClassifierOutput,
 } from "@/lib/ai/classifier";
 import { classifierGenerationSchema } from "@/lib/ai/types";
-import { getDefaultTemplateContent } from "@/lib/templates/schema";
+import { getDefaultTemplateContent, validateTemplateContent } from "@/lib/templates/schema";
 
 vi.mock("ai", async (importOriginal) => {
   const actual = await importOriginal<typeof import("ai")>();
@@ -128,7 +128,7 @@ describe("candidate intent classification", () => {
 });
 
 describe("equivalent valid phrasing", () => {
-  const content = {
+  const content = validateTemplateContent({
     ...getDefaultTemplateContent("Test"),
     actions: [
       {
@@ -139,7 +139,7 @@ describe("equivalent valid phrasing", () => {
         category: "diagnostic" as const,
       },
     ],
-  };
+  });
 
   it("matches differently worded valid requests to the same action", () => {
     expect(findMatchingAction(content, "From the client PC, ping www.coolsite.com")).toBe("ping-coolsite");
@@ -148,7 +148,7 @@ describe("equivalent valid phrasing", () => {
 });
 
 describe("classifier structured output", () => {
-  const content = {
+  const content = validateTemplateContent({
     ...getDefaultTemplateContent("Test"),
     actions: [
       {
@@ -159,7 +159,7 @@ describe("classifier structured output", () => {
         category: "diagnostic" as const,
       },
     ],
-  };
+  });
 
   beforeEach(() => {
     generateObjectMock.mockReset();

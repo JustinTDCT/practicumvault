@@ -55,7 +55,14 @@ const content = {
   ],
   environment: {
     rootCause: "SECRET_ROOT_CAUSE_HOSTS",
-    hiddenFacts: ["SECRET_HIDDEN_FACT"],
+    hiddenFacts: [
+      {
+        id: "fact-secret-hidden",
+        fact: "SECRET_HIDDEN_FACT",
+        sources: [],
+        revealWhen: [],
+      },
+    ],
     architectureNotes: "",
     redHerrings: ["SECRET_RED_HERRING"],
   },

@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   buildStaticResponse,
+  getApprovedDialogueFacts,
   selectEvidenceForAction,
 } from "@/lib/ai/simulation";
-import { getDefaultTemplateContent } from "@/lib/templates/schema";
+import { getDefaultTemplateContent, validateTemplateContent } from "@/lib/templates/schema";
 
-const content = {
+const content = validateTemplateContent({
   ...getDefaultTemplateContent("DNS scenario"),
   actions: [
     {
@@ -29,7 +30,7 @@ const content = {
     architectureNotes: "",
     redHerrings: [],
   },
-};
+});
 
 describe("simulation behavior", () => {
   it("reveals only configured evidence for valid actions", () => {
@@ -90,5 +91,10 @@ describe("simulation behavior", () => {
     const selected = selectEvidenceForAction(content, "user-call");
     expect(selected.evidence).toContain("Selina");
     expect(selected.evidence).not.toContain("HOSTS override");
+  });
+
+  it("never dumps all hidden facts when no action is matched", () => {
+    expect(getApprovedDialogueFacts(content, null)).toBe("");
+    expect(getApprovedDialogueFacts(content, "missing")).toBe("");
   });
 });

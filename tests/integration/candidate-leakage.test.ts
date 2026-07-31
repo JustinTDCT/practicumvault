@@ -3,7 +3,6 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { UserRole } from "@prisma/client";
 import { prisma, requireTestDatabase, resetTestDatabase, seedOrg, asSession, SECRETS_FOR } from "./helpers";
 import { assertNoCandidateLeakage } from "../../src/lib/dto/candidate";
-import { ScenarioTemplateContent } from "../../src/lib/templates/schema";
 import { IntentClassification } from "../../src/lib/ai/types";
 
 vi.mock("@/lib/auth", () => ({
@@ -29,6 +28,10 @@ vi.mock("@/lib/ai/classifier", async (importOriginal) => {
   };
 });
 
+vi.mock("@/lib/ai/grounded-simulation", () => ({
+  generateGroundedSimulationResponse: vi.fn(),
+}));
+
 vi.mock("@/lib/scoring/engine", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/scoring/engine")>();
   return {
@@ -39,6 +42,7 @@ vi.mock("@/lib/scoring/engine", async (importOriginal) => {
 
 import { requireAuth } from "@/lib/auth";
 import { classifyCandidateIntent } from "@/lib/ai/classifier";
+import { generateGroundedSimulationResponse } from "@/lib/ai/grounded-simulation";
 import { evaluateCurrentObjective } from "@/lib/scoring/engine";
 import { GET as dashboardGET } from "../../src/app/api/candidate/dashboard/route";
 import { POST as startPOST } from "../../src/app/api/attempts/start/route";
@@ -106,6 +110,7 @@ describe("candidate data leakage route coverage (integration)", () => {
     await resetTestDatabase();
     vi.mocked(requireAuth).mockReset();
     vi.mocked(classifyCandidateIntent).mockReset();
+    vi.mocked(generateGroundedSimulationResponse).mockReset();
     vi.mocked(evaluateCurrentObjective).mockReset();
     vi.mocked(evaluateCurrentObjective).mockResolvedValue([]);
   });
@@ -162,7 +167,7 @@ describe("candidate data leakage route coverage (integration)", () => {
     assertNoSecrets(body);
   });
 
-  it("static clarification path does not echo classifier reasoning or hidden facts", async () => {
+  it("grounded clarification path does not echo classifier reasoning or hidden facts", async () => {
     const seeded = await seedOrg("OrgA");
     vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.candidate));
     vi.mocked(classifyCandidateIntent).mockResolvedValue({
@@ -176,6 +181,16 @@ describe("candidate data leakage route coverage (integration)", () => {
       missingFields: ["target"],
       reasoning: "SECRET_ROOT_CAUSE_OrgA SECRET_AI_INSTRUCTIONS_OrgA",
     });
+    vi.mocked(generateGroundedSimulationResponse).mockResolvedValue({
+      interactionType: "CLARIFICATION",
+      responseText: "Which system do you want to run that on?",
+      disclosedFactIds: [],
+      clarificationNeeded: true,
+      clarificationQuestion: "Which system do you want to run that on?",
+      stateChanges: [],
+      usedFallback: false,
+      fallbackReason: null,
+    });
     const attemptId = await startAttempt(seeded.assignment.id);
 
     const res = await chat(attemptId, {
@@ -188,10 +203,59 @@ describe("candidate data leakage route coverage (integration)", () => {
     assertNoSecrets(text);
   });
 
-  it("deterministic evidence reveals only the approved action result", async () => {
+  it("grounded simulation can respond without a predefined action match", async () => {
+    const seeded = await seedOrg("OrgA");
+    vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.candidate));
+    vi.mocked(classifyCandidateIntent).mockResolvedValue({
+      decision: "VALID_ACTION",
+      targetType: "person",
+      matchedActionId: null,
+      target: "client",
+      methodOrTool: "call",
+      requestedAction: "ask for summary",
+      parameters: {},
+      missingFields: [],
+      reasoning: "natural language communication",
+    });
+    vi.mocked(generateGroundedSimulationResponse).mockResolvedValue({
+      interactionType: "COMMUNICATION",
+      responseText:
+        "Selina: I can get to other websites, but this particular site says the page cannot be reached.",
+      disclosedFactIds: [`fact-secret-hidden-orga`],
+      clarificationNeeded: false,
+      clarificationQuestion: null,
+      stateChanges: [],
+      usedFallback: false,
+      fallbackReason: null,
+    });
+    const attemptId = await startAttempt(seeded.assignment.id);
+
+    const res = await chat(attemptId, {
+      message: "Call the client and ask for a summary in her own words.",
+      turnId: "call-client-turn-0001",
+    });
+    expect(res.status).toBe(200);
+    const text = streamText(await res.text());
+    expect(text).toContain("Selina:");
+    expect(text).not.toBe("That action is not available in this environment.");
+    assertNoSecrets(text);
+    expect(generateGroundedSimulationResponse).toHaveBeenCalled();
+  });
+
+  it("grounded simulation reveals only disclosed facts, not root cause", async () => {
     const seeded = await seedOrg("OrgA");
     vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.candidate));
     vi.mocked(classifyCandidateIntent).mockResolvedValue(validHostsClassification());
+    vi.mocked(generateGroundedSimulationResponse).mockResolvedValue({
+      interactionType: "COMMAND_OR_TOOL",
+      responseText: "SECRET_ACTION_RESULT_OrgA",
+      disclosedFactIds: [],
+      clarificationNeeded: false,
+      clarificationQuestion: null,
+      stateChanges: [],
+      usedFallback: false,
+      fallbackReason: null,
+    });
     const attemptId = await startAttempt(seeded.assignment.id);
 
     const res = await chat(attemptId, {
@@ -204,37 +268,28 @@ describe("candidate data leakage route coverage (integration)", () => {
     assertNoSecrets(text);
   });
 
-  it("dialogue returns stored approved facts exactly and never invented generative facts", async () => {
+  it("dialogue simulation returns grounded response and does not invent extra facts", async () => {
     const seeded = await seedOrg("OrgA");
-    const content = seeded.content as ScenarioTemplateContent;
-    content.actions.push({
-      id: "call-user",
-      label: "Call user",
-      triggers: ["call user"],
-      result: "APPROVED_DIALOGUE_FACT_OrgA: Selina says only her PC is affected.",
-      category: "communication",
-      requirements: {
-        requireTarget: true,
-        requireMethodOrTool: true,
-        requiredParameters: [],
-        allowedTargets: ["Selina"],
-        allowedMethods: ["call"],
-        requirementsReviewed: true,
-        intentionallyUnrestricted: false,
-      },
-    });
-    await prisma.scenarioVersion.update({
-      where: { id: seeded.version.id },
-      data: { content },
-    });
-
     vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.candidate));
-    vi.mocked(classifyCandidateIntent).mockResolvedValue(validHostsClassification({
-      matchedActionId: "call-user",
-      target: "Selina",
-      methodOrTool: "call",
-      requestedAction: "call user",
-    }));
+    vi.mocked(classifyCandidateIntent).mockResolvedValue(
+      validHostsClassification({
+        matchedActionId: "call-user",
+        target: "Selina",
+        methodOrTool: "call",
+        requestedAction: "call user",
+        targetType: "person",
+      }),
+    );
+    vi.mocked(generateGroundedSimulationResponse).mockResolvedValue({
+      interactionType: "COMMUNICATION",
+      responseText: "APPROVED_DIALOGUE_FACT_OrgA: Selina says only her PC is affected.",
+      disclosedFactIds: [],
+      clarificationNeeded: false,
+      clarificationQuestion: null,
+      stateChanges: [],
+      usedFallback: false,
+      fallbackReason: null,
+    });
     const attemptId = await startAttempt(seeded.assignment.id);
 
     const res = await chat(attemptId, {
@@ -251,9 +306,9 @@ describe("candidate data leakage route coverage (integration)", () => {
     const events = await prisma.attemptEvent.findMany({
       where: { attemptId, type: "turn_classified" },
     });
-    expect(events.some((e) => (e.payload as { dialogueDeterministic?: boolean })?.dialogueDeterministic)).toBe(
-      true,
-    );
+    expect(
+      events.some((e) => (e.payload as { responseType?: string })?.responseType === "simulation_response"),
+    ).toBe(true);
   });
 
   it("returns 404 for candidate GET and chat against another organization's attempt", async () => {

@@ -89,7 +89,14 @@ export async function seedOrg(name: string) {
   const content = getDefaultTemplateContent(`${name} Scenario`);
   content.metadata.environment = `SECRET_SCENARIO_SNAPSHOT_${name}`;
   content.environment.rootCause = `SECRET_ROOT_CAUSE_${name}`;
-  content.environment.hiddenFacts = [`SECRET_HIDDEN_FACT_${name}`];
+  content.environment.hiddenFacts = [
+    {
+      id: `fact-secret-hidden-${name.toLowerCase()}`,
+      fact: `SECRET_HIDDEN_FACT_${name}`,
+      sources: [],
+      revealWhen: [],
+    },
+  ];
   content.environment.redHerrings = [`SECRET_RED_HERRING_${name}`];
   content.aiInstructions = `SECRET_AI_INSTRUCTIONS_${name}`;
   content.actions = [

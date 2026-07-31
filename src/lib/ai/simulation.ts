@@ -22,10 +22,10 @@ export function lookupScenarioAction(
 export function resolveResponseType(classification: IntentClassification): TurnResponseType {
   switch (classification.decision) {
     case "VALID_ACTION":
-      return "simulation_evidence";
+      return "simulation_response";
     case "AMBIGUOUS_ACTION":
     case "INCOMPLETE_ACTION":
-      return "clarification";
+      return "simulation_response";
     case "DELEGATION_REQUEST":
       return "delegation_refusal";
     case "ANSWER_SEEKING":
@@ -35,12 +35,20 @@ export function resolveResponseType(classification: IntentClassification): TurnR
     case "REFERENCE_QUESTION":
       return "reference_answer";
     case "MULTIPLE_ACTIONS":
-      return "multiple_actions_clarification";
+      return "simulation_response";
     case "UNAVAILABLE_ACTION":
-      return "unavailable_action";
+      return "simulation_response";
     default:
-      return "clarification";
+      return "simulation_response";
   }
+}
+
+export function isPolicyRefusalDecision(decision: IntentClassification["decision"]): boolean {
+  return (
+    decision === "DELEGATION_REQUEST" ||
+    decision === "ANSWER_SEEKING" ||
+    decision === "META_OR_PROMPT_ATTACK"
+  );
 }
 
 export function buildStaticResponse(classification: IntentClassification): string | null {
@@ -175,13 +183,15 @@ export function selectEvidenceForAction(
   return { evidence: action.result, evidenceIds: [action.id] };
 }
 
+/**
+ * Optional authored dialogue/result for a matched action.
+ * Never falls back to dumping all hidden facts.
+ */
 export function getApprovedDialogueFacts(
   content: ScenarioTemplateContent,
   actionId: string | null,
 ): string {
-  if (actionId) {
-    const action = content.actions.find((a) => a.id === actionId);
-    if (action) return action.result;
-  }
-  return content.environment.hiddenFacts.join("\n");
+  if (!actionId) return "";
+  const action = content.actions.find((a) => a.id === actionId);
+  return action?.result ?? "";
 }
