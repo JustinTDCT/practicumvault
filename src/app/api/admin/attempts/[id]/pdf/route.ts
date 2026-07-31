@@ -28,9 +28,10 @@ export async function GET(
   if (!attempt) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
   const reportData = buildReportData(attempt);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const element = React.createElement(AttemptReportDocument, { data: reportData });
+  // AttemptReportDocument renders a @react-pdf Document root; cast satisfies renderToBuffer typing.
   const buffer = await renderToBuffer(
-    React.createElement(AttemptReportDocument, { data: reportData }) as any,
+    element as Parameters<typeof renderToBuffer>[0],
   );
 
   return new NextResponse(new Uint8Array(buffer), {

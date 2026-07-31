@@ -16,11 +16,31 @@ interface ChatInterfaceProps {
   timerSettings: { showCountdown: boolean; showElapsed: boolean };
   expiresAt: string;
   startedAt: string;
+  submittedAt?: string | null;
   status?: string;
   completedAt?: string | null;
   onComplete: () => void;
   onAbort: () => void;
   readOnly?: boolean;
+}
+
+function parseDataStreamChunk(buffer: string, chunk: string): { text: string; remainder: string } {
+  const combined = buffer + chunk;
+  const lines = combined.split("\n");
+  const remainder = lines.pop() ?? "";
+  let text = "";
+
+  for (const line of lines) {
+    if (line.startsWith("0:")) {
+      try {
+        text += JSON.parse(line.slice(2));
+      } catch {
+        // wait for complete line
+      }
+    }
+  }
+
+  return { text, remainder };
 }
 
 export function ChatInterface({
@@ -29,6 +49,7 @@ export function ChatInterface({
   timerSettings,
   expiresAt,
   startedAt,
+  submittedAt,
   status,
   completedAt,
   onComplete,
@@ -39,6 +60,7 @@ export function ChatInterface({
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [streamingContent, setStreamingContent] = useState("");
+  const [error, setError] = useState<string | null>(null);
   const [remaining, setRemaining] = useState("");
   const [elapsed, setElapsed] = useState("");
   const [stoppedAt, setStoppedAt] = useState<number | null>(null);
@@ -48,6 +70,7 @@ export function ChatInterface({
   const sessionEnded = status != null && status !== "IN_PROGRESS";
   const frozenAtMs =
     stoppedAt ??
+    (submittedAt ? new Date(submittedAt).getTime() : null) ??
     (sessionEnded
       ? completedAt
         ? new Date(completedAt).getTime()
@@ -106,6 +129,7 @@ export function ChatInterface({
     const userMessage = input.trim();
     setInput("");
     setLoading(true);
+    setError(null);
     setMessages((prev) => [
       ...prev,
       { id: `temp-${Date.now()}`, role: "user", content: userMessage },
@@ -119,12 +143,14 @@ export function ChatInterface({
       });
 
       if (!res.ok) {
-        throw new Error("Failed to send message");
+        const errData = await res.json().catch(() => ({}));
+        throw new Error((errData as { error?: string }).error ?? "Failed to send message");
       }
 
       const reader = res.body?.getReader();
       const decoder = new TextDecoder();
       let assistantText = "";
+      let lineBuffer = "";
       setStreamingContent("");
 
       if (reader) {
@@ -132,30 +158,32 @@ export function ChatInterface({
           const { done, value } = await reader.read();
           if (done) break;
           const chunk = decoder.decode(value, { stream: true });
-          for (const line of chunk.split("\n")) {
-            if (line.startsWith("0:")) {
-              try {
-                const text = JSON.parse(line.slice(2));
-                assistantText += text;
-                setStreamingContent(assistantText);
-              } catch {
-                // skip malformed chunks
-              }
-            }
+          const parsed = parseDataStreamChunk(lineBuffer, chunk);
+          lineBuffer = parsed.remainder;
+          if (parsed.text) {
+            assistantText += parsed.text;
+            setStreamingContent(assistantText);
+          }
+        }
+        if (lineBuffer.startsWith("0:")) {
+          try {
+            assistantText += JSON.parse(lineBuffer.slice(2));
+            setStreamingContent(assistantText);
+          } catch {
+            // incomplete final line
           }
         }
       }
 
-      setMessages((prev) => [
-        ...prev,
-        { id: `assistant-${Date.now()}`, role: "assistant", content: assistantText },
-      ]);
+      if (assistantText.trim()) {
+        setMessages((prev) => [
+          ...prev,
+          { id: `assistant-${Date.now()}`, role: "assistant", content: assistantText.trim() },
+        ]);
+      }
       setStreamingContent("");
-    } catch {
-      setMessages((prev) => [
-        ...prev,
-        { id: `error-${Date.now()}`, role: "assistant", content: "An error occurred. Please try again." },
-      ]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "An error occurred");
     } finally {
       setLoading(false);
     }
@@ -163,42 +191,70 @@ export function ChatInterface({
 
   async function requestHint() {
     setLoading(true);
-    const res = await fetch(`/api/attempts/${attemptId}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "hint" }),
-    });
-    const data = await res.json();
-    setLoading(false);
-    if (res.ok) {
+    setError(null);
+    try {
+      const res = await fetch(`/api/attempts/${attemptId}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "hint" }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error((data as { error?: string }).error ?? "Failed to request hint");
+      }
       setMessages((prev) => [
         ...prev,
-        { id: `hint-${Date.now()}`, role: "assistant", content: `**Hint**\n\n${data.hint}` },
+        { id: `hint-${Date.now()}`, role: "assistant", content: `**Hint**\n\n${(data as { hint: string }).hint}` },
       ]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to request hint");
+    } finally {
+      setLoading(false);
     }
   }
 
   async function checkObjectives() {
     setLoading(true);
-    await fetch(`/api/attempts/${attemptId}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "evaluate_objective" }),
-    });
-    setLoading(false);
+    setError(null);
+    try {
+      const res = await fetch(`/api/attempts/${attemptId}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "evaluate_objective" }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error((data as { error?: string }).error ?? "Objective check failed");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Objective check failed");
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function completeAssessment() {
     if (!confirm("Submit your assessment for scoring?")) return;
     setStoppedAt(Date.now());
     setLoading(true);
-    await fetch(`/api/attempts/${attemptId}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "complete" }),
-    });
-    setLoading(false);
-    onComplete();
+    setError(null);
+    try {
+      const res = await fetch(`/api/attempts/${attemptId}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "complete" }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error((data as { error?: string }).error ?? "Submission failed");
+      }
+      onComplete();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Submission failed");
+      setStoppedAt(null);
+    } finally {
+      setLoading(false);
+    }
   }
 
   const timerClass = timersFrozen ? "chat-timer chat-timer-frozen" : "chat-timer";
@@ -241,6 +297,8 @@ export function ChatInterface({
           </div>
         )}
       </div>
+
+      {error && <div className="alert alert-error">{error}</div>}
 
       <div className="chat-messages">
         {messages.map((m) => (

@@ -34,7 +34,10 @@ enum AssignmentStatus {
 
 enum AttemptStatus {
   IN_PROGRESS
+  SUBMITTED
+  SCORING
   COMPLETED
+  SCORING_FAILED
   ABORTED
   TIMED_OUT
 }
@@ -72,6 +75,7 @@ model User {
   role         UserRole
   isPrimaryAdmin Boolean @default(false) @map("is_primary_admin")
   enabled      Boolean  @default(true)
+  sessionVersion Int    @default(0) @map("session_version")
   notes        String   @default("")
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
@@ -175,6 +179,7 @@ model Attempt {
   id        String        @id @default(cuid())
   status    AttemptStatus @default(IN_PROGRESS)
   startedAt DateTime      @default(now()) @map("started_at")
+  submittedAt DateTime?   @map("submitted_at")
   completedAt DateTime?   @map("completed_at")
   expiresAt DateTime      @map("expires_at")
 
@@ -182,8 +187,11 @@ model Attempt {
   hintsUsed        Int @default(0) @map("hints_used")
   hintsPenalty     Int @default(0) @map("hints_penalty")
   unsafeActions    Json @default("[]") @map("unsafe_actions")
+  unsafeActionRecords Json @default("[]") @map("unsafe_action_records")
 
   gateStates     Json @default("[]") @map("gate_states")
+  scenarioSnapshot Json? @map("scenario_snapshot")
+  revealedEvidenceIds Json @default("[]") @map("revealed_evidence_ids")
   scoreBreakdown Json? @map("score_breakdown")
   overallScore   Int?
   aiRecommendation String? @map("ai_recommendation")
@@ -192,6 +200,15 @@ model Attempt {
   adminNotes       String  @default("") @map("admin_notes")
 
   scoringComplete Boolean @default(false) @map("scoring_complete")
+  modelCallsCount Int @default(0) @map("model_calls_count")
+  messageCount Int @default(0) @map("message_count")
+  classifierModel String? @map("classifier_model")
+  responderModel String? @map("responder_model")
+  scoringModel String? @map("scoring_model")
+  simulationPromptVersion String? @map("simulation_prompt_version")
+  scoringPromptVersion String? @map("scoring_prompt_version")
+  scoringEngineVersion String? @map("scoring_engine_version")
+  scoringAttempts Int @default(0) @map("scoring_attempts")
 
   organizationId String       @map("organization_id")
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
@@ -210,6 +227,7 @@ model Attempt {
 
   @@index([status])
   @@index([candidateId])
+  @@index([candidateId, status])
   @@index([startedAt])
 }
 
@@ -236,4 +254,15 @@ model AttemptEvent {
   attempt   Attempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
 
   @@index([attemptId, createdAt])
+}
+
+model LoginAttempt {
+  id        String   @id @default(cuid())
+  email     String
+  ipAddress String?  @map("ip_address")
+  success   Boolean
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([email, createdAt])
+  @@map("login_attempts")
 }

@@ -3,17 +3,21 @@ import crypto from "crypto";
 const ALGORITHM = "aes-256-gcm";
 const IV_LENGTH = 12;
 
+/**
+ * AES-256-GCM key: exactly 64 hex characters (32 bytes).
+ * Generate with: openssl rand -hex 32
+ */
 function getKey(): Buffer {
   const raw = process.env.ENCRYPTION_KEY;
   if (!raw) {
     throw new Error("ENCRYPTION_KEY is not set");
   }
-  if (/^[0-9a-fA-F]{32}$/.test(raw)) {
-    return Buffer.from(raw, "hex");
+  if (!/^[0-9a-fA-F]{64}$/.test(raw)) {
+    throw new Error(
+      "ENCRYPTION_KEY must be exactly 64 hexadecimal characters (32 bytes). Generate with: openssl rand -hex 32",
+    );
   }
-  const buf = Buffer.from(raw, "utf8");
-  if (buf.length === 32) return buf;
-  return crypto.createHash("sha256").update(raw).digest();
+  return Buffer.from(raw, "hex");
 }
 
 export function encrypt(plaintext: string): string {

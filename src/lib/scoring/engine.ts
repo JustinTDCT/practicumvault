@@ -1,14 +1,27 @@
-import { generateObject, generateText } from "ai";
+import { generateObject } from "ai";
 import { z } from "zod";
 import { prisma } from "@/lib/db";
-import { getLanguageModel } from "@/lib/ai/provider";
+import { getLanguageModel, providerLabel } from "@/lib/ai/provider";
 import { buildObjectiveEvaluationPrompt, buildScoringPrompt } from "@/lib/ai/prompts";
 import {
   ObjectiveState,
+  getBoundedTranscript,
   parseObjectiveStates,
-  parseTemplateContent,
+  parseRevealedEvidenceIds,
+  parseUnsafeActionRecords,
+  getAttemptScenarioContent,
+  getSnapshotFromAttempt,
 } from "@/lib/attempts/service";
 import { AttemptStatus, AssignmentStatus } from "@prisma/client";
+import { LIMITS } from "@/lib/config/limits";
+import { SCORING_ENGINE_VERSION, SCORING_PROMPT_VERSION } from "@/lib/config/versions";
+import { sumUnsafePenalties } from "@/lib/scoring/unsafe-actions";
+import {
+  clampFinalScore,
+  computeWeightedScore,
+  validateCategoryScores,
+} from "@/lib/scoring/validate-score";
+import { ScenarioTemplateContent } from "@/lib/templates/schema";
 
 const objectiveEvalSchema = z.object({
   passed: z.boolean(),
@@ -17,7 +30,7 @@ const objectiveEvalSchema = z.object({
   missingEvidence: z.array(z.string()),
 });
 
-const scoringSchema = z.object({
+const scoringNarrativeSchema = z.object({
   categoryScores: z.array(
     z.object({
       name: z.string(),
@@ -25,32 +38,85 @@ const scoringSchema = z.object({
       notes: z.string(),
     }),
   ),
-  overallScore: z.number(),
   strengths: z.string(),
   developmentAreas: z.string(),
   recommendation: z.string(),
-  unsafeActionsDetected: z.array(z.string()),
 });
+
+export interface StructuredTurnEvent {
+  candidateMessageId: string;
+  classificationDecision: string;
+  matchedActionId: string | null;
+  evidenceIds: string[];
+  responseType: string;
+}
+
+function buildStructuredContext(
+  turnEvents: StructuredTurnEvent[],
+  revealedEvidenceIds: string[],
+  unsafeRecords: ReturnType<typeof parseUnsafeActionRecords>,
+  objectiveStates: ObjectiveState[],
+): string {
+  return JSON.stringify(
+    {
+      matchedActions: turnEvents.filter((e) => e.matchedActionId).map((e) => e.matchedActionId),
+      revealedEvidenceIds,
+      unsafeActions: unsafeRecords.map((r) => ({
+        id: r.unsafeActionId,
+        penalty: r.penalty,
+        messageId: r.candidateMessageId,
+      })),
+      objectiveStates,
+      turnSummary: turnEvents.map((e) => ({
+        decision: e.classificationDecision,
+        action: e.matchedActionId,
+        evidence: e.evidenceIds,
+        responseType: e.responseType,
+      })),
+    },
+    null,
+    2,
+  );
+}
+
+
+async function loadTurnEvents(attemptId: string): Promise<StructuredTurnEvent[]> {
+  const events = await prisma.attemptEvent.findMany({
+    where: { attemptId, type: "turn_classified" },
+    orderBy: { createdAt: "asc" },
+  });
+  return events.map((e) => {
+    const p = e.payload as Record<string, unknown>;
+    return {
+      candidateMessageId: String(p.candidateMessageId ?? ""),
+      classificationDecision: String(p.classificationDecision ?? ""),
+      matchedActionId: (p.matchedActionId as string | null) ?? null,
+      evidenceIds: Array.isArray(p.evidenceIds) ? (p.evidenceIds as string[]) : [],
+      responseType: String(p.responseType ?? ""),
+    };
+  });
+}
 
 export async function evaluateCurrentObjective(attemptId: string): Promise<ObjectiveState[]> {
   const attempt = await prisma.attempt.findUnique({
     where: { id: attemptId },
     include: {
       messages: { orderBy: { createdAt: "asc" } },
-      scenarioVersion: true,
       organization: true,
     },
   });
   if (!attempt) throw new Error("Attempt not found");
 
-  const content = parseTemplateContent(attempt.scenarioVersion.content);
+  const content = getAttemptScenarioContent(attempt);
   const objectiveStates = parseObjectiveStates(attempt.gateStates);
   const currentIndex = attempt.currentGateIndex;
   if (currentIndex >= content.objectives.length) return objectiveStates;
 
-  const transcript = attempt.messages
-    .map((m) => `[${m.role.toUpperCase()}] ${m.content}`)
-    .join("\n\n");
+  const turnEvents = await loadTurnEvents(attemptId);
+  const revealedEvidenceIds = parseRevealedEvidenceIds(attempt.revealedEvidenceIds);
+  const unsafeRecords = parseUnsafeActionRecords(attempt.unsafeActionRecords);
+  const transcript = getBoundedTranscript(attempt.messages);
+  const structured = buildStructuredContext(turnEvents, revealedEvidenceIds, unsafeRecords, objectiveStates);
 
   const model = getLanguageModel(attempt.organization);
   const objective = content.objectives[currentIndex];
@@ -58,7 +124,15 @@ export async function evaluateCurrentObjective(attemptId: string): Promise<Objec
   const { object } = await generateObject({
     model,
     schema: objectiveEvalSchema,
-    prompt: buildObjectiveEvaluationPrompt(content, currentIndex, transcript),
+    prompt: `${buildObjectiveEvaluationPrompt(content, currentIndex, transcript)}
+
+Structured attempt events (primary evidence — do not invent actions not listed here):
+${structured}
+
+Rules:
+- Use matched action IDs and revealed evidence IDs as primary proof
+- Do not pass objectives requiring investigation based on stated conclusions alone
+- Transcript is supporting context only`,
   });
 
   const existing = objectiveStates.find((o) => o.objectiveId === objective.id);
@@ -82,6 +156,7 @@ export async function evaluateCurrentObjective(attemptId: string): Promise<Objec
     data: {
       gateStates: newStates as object,
       currentGateIndex: nextIndex,
+      modelCallsCount: { increment: 1 },
     },
   });
 
@@ -104,17 +179,18 @@ export async function evaluateAllObjectives(attemptId: string): Promise<Objectiv
     where: { id: attemptId },
     include: {
       messages: { orderBy: { createdAt: "asc" } },
-      scenarioVersion: true,
       organization: true,
     },
   });
   if (!attempt) throw new Error("Attempt not found");
 
-  const content = parseTemplateContent(attempt.scenarioVersion.content);
+  const content = getAttemptScenarioContent(attempt);
   const existingStates = parseObjectiveStates(attempt.gateStates);
-  const transcript = attempt.messages
-    .map((m) => `[${m.role.toUpperCase()}] ${m.content}`)
-    .join("\n\n");
+  const turnEvents = await loadTurnEvents(attemptId);
+  const revealedEvidenceIds = parseRevealedEvidenceIds(attempt.revealedEvidenceIds);
+  const unsafeRecords = parseUnsafeActionRecords(attempt.unsafeActionRecords);
+  const transcript = getBoundedTranscript(attempt.messages);
+  const structured = buildStructuredContext(turnEvents, revealedEvidenceIds, unsafeRecords, existingStates);
 
   const model = getLanguageModel(attempt.organization);
   const objectiveStates: ObjectiveState[] = [];
@@ -124,7 +200,10 @@ export async function evaluateAllObjectives(attemptId: string): Promise<Objectiv
     const { object } = await generateObject({
       model,
       schema: objectiveEvalSchema,
-      prompt: buildObjectiveEvaluationPrompt(content, i, transcript),
+      prompt: `${buildObjectiveEvaluationPrompt(content, i, transcript)}
+
+Structured attempt events (primary evidence):
+${structured}`,
     });
 
     const existing = existingStates.find((o) => o.objectiveId === objective.id);
@@ -154,6 +233,7 @@ export async function evaluateAllObjectives(attemptId: string): Promise<Objectiv
       gateStates: objectiveStates as object,
       currentGateIndex:
         firstIncomplete === -1 ? content.objectives.length - 1 : firstIncomplete,
+      modelCallsCount: { increment: content.objectives.length },
     },
   });
 
@@ -163,104 +243,257 @@ export async function evaluateAllObjectives(attemptId: string): Promise<Objectiv
 /** @deprecated Use evaluateAllObjectives */
 export const evaluateAllGates = evaluateAllObjectives;
 
-export async function finalizeAttemptScoring(attemptId: string) {
-  const objectiveStates = await evaluateAllObjectives(attemptId);
+async function generateValidatedScoringNarrative(
+  attemptId: string,
+  content: ScenarioTemplateContent,
+  transcript: string,
+  objectiveStates: ObjectiveState[],
+  unsafeDescriptions: string[],
+  hintsUsed: number,
+  structured: string,
+  retryCount: number,
+): Promise<z.infer<typeof scoringNarrativeSchema>> {
+  const attempt = await prisma.attempt.findUnique({
+    where: { id: attemptId },
+    include: { organization: true },
+  });
+  if (!attempt) throw new Error("Attempt not found");
 
+  const model = getLanguageModel(attempt.organization);
+
+  try {
+    const { object } = await generateObject({
+      model,
+      schema: scoringNarrativeSchema,
+      prompt: `${buildScoringPrompt(
+        content,
+        transcript,
+        objectiveStates.map((o) => ({ objectiveId: o.objectiveId, passed: o.passed })),
+        unsafeDescriptions,
+        hintsUsed,
+      )}
+
+Structured attempt events (do not invent actions or evidence beyond this):
+${structured}
+
+Provide narrative fields and category score estimates. Penalties are applied server-side.`,
+    });
+
+    validateCategoryScores(content, object.categoryScores);
+    return object;
+  } catch (err) {
+    if (retryCount >= LIMITS.scoringMaxRetries) {
+      throw err;
+    }
+    return generateValidatedScoringNarrative(
+      attemptId,
+      content,
+      transcript,
+      objectiveStates,
+      unsafeDescriptions,
+      hintsUsed,
+      structured,
+      retryCount + 1,
+    );
+  }
+}
+
+export async function scoreAttempt(attemptId: string, options?: { rescore?: boolean }) {
   const attempt = await prisma.attempt.findUnique({
     where: { id: attemptId },
     include: {
       messages: { orderBy: { createdAt: "asc" } },
-      scenarioVersion: { include: { template: true } },
       organization: true,
       candidate: true,
       assignment: { include: { position: true } },
+      scenarioVersion: { include: { template: true } },
     },
   });
   if (!attempt) throw new Error("Attempt not found");
 
-  const content = parseTemplateContent(attempt.scenarioVersion.content);
-  const allCompleted = content.objectives.every((o) =>
-    objectiveStates.find((s) => s.objectiveId === o.id)?.passed,
-  );
+  if (
+    !options?.rescore &&
+    (attempt.status === AttemptStatus.COMPLETED || attempt.status === AttemptStatus.SCORING)
+  ) {
+    return attempt;
+  }
 
-  const transcript = attempt.messages
-    .map((m) => `[${m.role.toUpperCase()}] ${m.content}`)
-    .join("\n\n");
-
-  const unsafeActions = Array.isArray(attempt.unsafeActions)
-    ? (attempt.unsafeActions as string[])
-    : [];
-
-  const model = getLanguageModel(attempt.organization);
-  const { object } = await generateObject({
-    model,
-    schema: scoringSchema,
-    prompt: buildScoringPrompt(
-      content,
-      transcript,
-      objectiveStates.map((o) => ({ objectiveId: o.objectiveId, passed: o.passed })),
-      unsafeActions,
-      attempt.hintsUsed,
-    ),
-  });
-
-  let finalScore = object.overallScore;
-
-  if (object.categoryScores.length > 0) {
-    const weighted = object.categoryScores.reduce((sum, cs) => {
-      const rubric = content.scoringRubric.categories.find((c) => c.name === cs.name);
-      const weight = rubric?.weight ?? 0;
-      return sum + cs.score * (weight / 100);
-    }, 0);
-    if (weighted > 0) {
-      finalScore = Math.round(weighted);
+  if (!options?.rescore) {
+    if (
+      attempt.status !== AttemptStatus.SUBMITTED &&
+      attempt.status !== AttemptStatus.SCORING_FAILED
+    ) {
+      throw new Error("Attempt must be submitted before scoring");
     }
+  } else if (!attempt.submittedAt) {
+    throw new Error("Attempt has not been submitted");
   }
-
-  finalScore -= attempt.hintsPenalty;
-
-  const policyViolations = await prisma.attemptEvent.count({
-    where: { attemptId, type: "policy_violation" },
-  });
-  finalScore -= policyViolations * 5;
-
-  const objectivesCompleted = objectiveStates.filter((o) => o.passed).length;
-  const objectivesTotal = content.objectives.length;
-  if (objectivesCompleted < objectivesTotal) {
-    const missed = objectivesTotal - objectivesCompleted;
-    finalScore -= missed * 3;
-  }
-
-  finalScore = Math.max(0, Math.min(100, Math.round(finalScore)));
 
   await prisma.attempt.update({
     where: { id: attemptId },
-    data: {
-      status: AttemptStatus.COMPLETED,
-      completedAt: new Date(),
-      scoreBreakdown: object.categoryScores,
-      overallScore: finalScore,
-      strengths: object.strengths,
-      developmentAreas: object.developmentAreas,
-      aiRecommendation: object.recommendation,
-      unsafeActions: [...unsafeActions, ...object.unsafeActionsDetected],
-      scoringComplete: true,
-    },
+    data: { status: AttemptStatus.SCORING, scoringAttempts: { increment: 1 } },
   });
 
-  await prisma.assignment.update({
-    where: { id: attempt.assignmentId },
-    data: { status: AssignmentStatus.COMPLETED },
-  });
+  try {
+    const objectiveStates = await evaluateAllObjectives(attemptId);
+    const refreshed = await prisma.attempt.findUnique({
+      where: { id: attemptId },
+      include: {
+        messages: { orderBy: { createdAt: "asc" } },
+        organization: true,
+      },
+    });
+    if (!refreshed) throw new Error("Attempt not found");
 
-  await prisma.attemptEvent.create({
-    data: {
+    const content = getAttemptScenarioContent(refreshed);
+    const snapshot = getSnapshotFromAttempt(refreshed);
+    const turnEvents = await loadTurnEvents(attemptId);
+    const revealedEvidenceIds = parseRevealedEvidenceIds(refreshed.revealedEvidenceIds);
+    const unsafeRecords = parseUnsafeActionRecords(refreshed.unsafeActionRecords);
+    const transcript = getBoundedTranscript(refreshed.messages);
+    const structured = buildStructuredContext(
+      turnEvents,
+      revealedEvidenceIds,
+      unsafeRecords,
+      objectiveStates,
+    );
+
+    const narrative = await generateValidatedScoringNarrative(
       attemptId,
-      type: "scored",
-      payload: { overallScore: finalScore, allObjectivesCompleted: allCompleted },
-    },
+      content,
+      transcript,
+      objectiveStates,
+      unsafeRecords.map((r) => r.description),
+      refreshed.hintsUsed,
+      structured,
+      0,
+    );
+
+    const validatedCategories = validateCategoryScores(content, narrative.categoryScores);
+    let finalScore = computeWeightedScore(content, validatedCategories);
+
+    finalScore -= refreshed.hintsPenalty;
+
+    const policyViolations = await prisma.attemptEvent.count({
+      where: { attemptId, type: "policy_violation" },
+    });
+    finalScore -= policyViolations * 5;
+    finalScore -= sumUnsafePenalties(unsafeRecords);
+
+    const objectivesCompleted = objectiveStates.filter((o) => o.passed).length;
+    const objectivesTotal = content.objectives.length;
+    if (objectivesCompleted < objectivesTotal) {
+      finalScore -= (objectivesTotal - objectivesCompleted) * 3;
+    }
+
+    finalScore = clampFinalScore(finalScore);
+
+    const modelName =
+      refreshed.organization.llmProvider === "ANTHROPIC"
+        ? refreshed.organization.anthropicModel
+        : refreshed.organization.llmProvider === "OPENAI"
+          ? refreshed.organization.openaiModel
+          : refreshed.organization.localLlmModel;
+
+    await prisma.attempt.update({
+      where: { id: attemptId },
+      data: {
+        status: AttemptStatus.COMPLETED,
+        completedAt: refreshed.completedAt ?? new Date(),
+        scoreBreakdown: validatedCategories,
+        overallScore: finalScore,
+        strengths: narrative.strengths,
+        developmentAreas: narrative.developmentAreas,
+        aiRecommendation: narrative.recommendation,
+        unsafeActions: unsafeRecords.map((r) => r.description),
+        scoringComplete: true,
+        scoringModel: `${providerLabel(refreshed.organization.llmProvider)}/${modelName}`,
+        scoringPromptVersion: snapshot.scoringPromptVersion,
+        scoringEngineVersion: SCORING_ENGINE_VERSION,
+      },
+    });
+
+    await prisma.assignment.update({
+      where: { id: refreshed.assignmentId },
+      data: { status: AssignmentStatus.COMPLETED },
+    });
+
+    await prisma.attemptEvent.create({
+      data: {
+        attemptId,
+        type: "scored",
+        payload: {
+          overallScore: finalScore,
+          scoringEngineVersion: SCORING_ENGINE_VERSION,
+          scoringPromptVersion: SCORING_PROMPT_VERSION,
+        },
+      },
+    });
+
+    return prisma.attempt.findUnique({
+      where: { id: attemptId },
+      include: {
+        candidate: true,
+        scenarioVersion: { include: { template: true } },
+        assignment: { include: { position: true } },
+      },
+    });
+  } catch (err) {
+    await prisma.attempt.update({
+      where: { id: attemptId },
+      data: {
+        status: AttemptStatus.SCORING_FAILED,
+        scoringComplete: false,
+      },
+    });
+    await prisma.attemptEvent.create({
+      data: {
+        attemptId,
+        type: "scoring_failed",
+        payload: { error: err instanceof Error ? err.message : "Unknown scoring error" },
+      },
+    });
+    throw err;
+  }
+}
+
+export async function submitAttempt(attemptId: string) {
+  const now = new Date();
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const attempt = await tx.attempt.findUnique({ where: { id: attemptId } });
+    if (!attempt) throw new Error("Attempt not found");
+    if (attempt.status !== AttemptStatus.IN_PROGRESS) {
+      return attempt;
+    }
+
+    return tx.attempt.update({
+      where: { id: attemptId, status: AttemptStatus.IN_PROGRESS },
+      data: {
+        status: AttemptStatus.SUBMITTED,
+        submittedAt: now,
+        completedAt: now,
+      },
+    });
   });
 
+  if (updated.status === AttemptStatus.SUBMITTED) {
+    await prisma.attemptEvent.create({
+      data: {
+        attemptId,
+        type: "submitted",
+        payload: { submittedAt: now.toISOString() },
+      },
+    });
+    await scoreAttempt(attemptId);
+  }
+
+  return updated;
+}
+
+/** @deprecated Use submitAttempt + scoreAttempt */
+export async function finalizeAttemptScoring(attemptId: string) {
+  await submitAttempt(attemptId);
   return prisma.attempt.findUnique({
     where: { id: attemptId },
     include: {
@@ -271,55 +504,12 @@ export async function finalizeAttemptScoring(attemptId: string) {
   });
 }
 
-export async function detectUnsafeAction(
-  attemptId: string,
-  candidateMessage: string,
-): Promise<string | null> {
-  const attempt = await prisma.attempt.findUnique({
-    where: { id: attemptId },
-    include: { scenarioVersion: true, organization: true },
+export async function rescoreAttempt(attemptId: string, organizationId: string) {
+  const attempt = await prisma.attempt.findFirst({
+    where: { id: attemptId, organizationId },
   });
-  if (!attempt) return null;
+  if (!attempt) throw new Error("Attempt not found");
+  if (!attempt.submittedAt) throw new Error("Attempt has not been submitted");
 
-  const content = parseTemplateContent(attempt.scenarioVersion.content);
-  const model = getLanguageModel(attempt.organization);
-
-  const { text } = await generateText({
-    model,
-    prompt: `Analyze if this candidate action in a technical simulation is unsafe or reckless.
-
-Predefined unsafe patterns:
-${content.scoringRubric.unsafeActions.map((u) => `- ${u.description}`).join("\n") || "None"}
-
-Candidate action: "${candidateMessage}"
-
-If unsafe, respond with JSON: {"unsafe": true, "reason": "..."}
-If safe or normal diagnostic, respond with JSON: {"unsafe": false}`,
-  });
-
-  try {
-    const parsed = JSON.parse(text.replace(/```json\n?|\n?```/g, "").trim());
-    if (parsed.unsafe && parsed.reason) {
-      const existing = Array.isArray(attempt.unsafeActions)
-        ? (attempt.unsafeActions as string[])
-        : [];
-      if (!existing.includes(parsed.reason)) {
-        await prisma.attempt.update({
-          where: { id: attemptId },
-          data: { unsafeActions: [...existing, parsed.reason] },
-        });
-        await prisma.attemptEvent.create({
-          data: {
-            attemptId,
-            type: "unsafe_action",
-            payload: { reason: parsed.reason },
-          },
-        });
-      }
-      return parsed.reason;
-    }
-  } catch {
-    // ignore parse errors
-  }
-  return null;
+  return scoreAttempt(attemptId, { rescore: true });
 }

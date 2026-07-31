@@ -5,6 +5,7 @@ import { StringListEditor } from "@/components/string-list-editor";
 import { ScenarioTemplateContent, validateTemplateContent } from "@/lib/templates/schema";
 import { getNextObjectiveId, reindexObjectives } from "@/lib/templates/objectives";
 import { useParams } from "next/navigation";
+import Link from "next/link";
 import { useEffect, useState } from "react";
 
 export default function TemplateEditorPage() {
@@ -122,7 +123,7 @@ export default function TemplateEditorPage() {
               Publish
             </button>
           )}
-          <a className="btn btn-secondary" href="/admin/templates">Back to templates</a>
+          <Link className="btn btn-secondary" href="/admin/templates">Back to templates</Link>
         </div>
 
         <div className="card" style={{ marginBottom: 16 }}>

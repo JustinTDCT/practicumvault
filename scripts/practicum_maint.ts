@@ -4,13 +4,16 @@
  *
  * Usage:
  *   npm run maint -- --password --admin@example.com
- *   npm run maint -- --password admin@example.com   (also supported)
+ *   NEW_PASSWORD=secret npm run maint -- --password admin@example.com
+ *
+ * Password input: set NEW_PASSWORD in the environment for non-echoing use.
+ * Interactive mode uses stty to disable terminal echo when available.
  */
 
 import { PrismaClient } from "@prisma/client";
 import bcrypt from "bcryptjs";
-import crypto from "crypto";
 import readline from "readline";
+import { spawnSync } from "child_process";
 
 const prisma = new PrismaClient();
 
@@ -33,13 +36,27 @@ function parseArgs(argv: string[]) {
 }
 
 async function promptHidden(question: string): Promise<string> {
+  if (!process.stdin.isTTY) {
+    console.error(
+      "Interactive password entry requires a TTY. Set NEW_PASSWORD in the environment instead.",
+    );
+    process.exit(1);
+  }
+
+  process.stdout.write(question);
+  spawnSync("stty", ["-echo"], { stdio: "inherit" });
+
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => {
-    rl.question(question, (answer) => {
+  const answer = await new Promise<string>((resolve) => {
+    rl.question("", (value) => {
       rl.close();
-      resolve(answer);
+      resolve(value);
     });
   });
+
+  spawnSync("stty", ["echo"], { stdio: "inherit" });
+  process.stdout.write("\n");
+  return answer;
 }
 
 async function resetPassword(email: string) {
@@ -51,7 +68,7 @@ async function resetPassword(email: string) {
 
   let password = process.env.NEW_PASSWORD;
   if (!password) {
-    password = await promptHidden("New password (min 8 chars): ");
+    password = await promptHidden("New password (min 8 chars, hidden): ");
   }
 
   if (!password || password.length < 8) {
@@ -61,10 +78,13 @@ async function resetPassword(email: string) {
 
   await prisma.user.update({
     where: { id: user.id },
-    data: { passwordHash: await bcrypt.hash(password, 12) },
+    data: {
+      passwordHash: await bcrypt.hash(password, 12),
+      sessionVersion: { increment: 1 },
+    },
   });
 
-  console.log(`Password reset for ${user.email} (${user.fullName}, ${user.role})`);
+  console.log(`Password reset for ${user.email} (${user.fullName}, ${user.role}). All sessions revoked.`);
 }
 
 async function main() {
@@ -79,7 +99,7 @@ Commands:
   npm run maint -- --password <email>
 
 Environment:
-  NEW_PASSWORD  Optional non-interactive password
+  NEW_PASSWORD  Recommended non-interactive password (no terminal echo)
   DATABASE_URL  PostgreSQL connection string
 `);
     process.exit(0);

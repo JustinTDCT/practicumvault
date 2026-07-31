@@ -1,12 +1,14 @@
 import { NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
 import { prisma } from "@/lib/db";
-import { getTimerState } from "@/lib/attempts/service";
+import { getTimerState, reconcileExpiredAttempts } from "@/lib/attempts/service";
 import { AttemptStatus, UserRole } from "@prisma/client";
 
 export async function GET() {
   const session = await requireAuth([UserRole.ADMIN]);
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  await reconcileExpiredAttempts();
 
   const attempts = await prisma.attempt.findMany({
     where: {

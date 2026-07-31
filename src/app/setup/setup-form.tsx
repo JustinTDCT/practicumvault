@@ -9,6 +9,7 @@ export default function SetupForm() {
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [bootstrapToken, setBootstrapToken] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -20,7 +21,7 @@ export default function SetupForm() {
     const res = await fetch("/api/setup", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ orgName, fullName, email, password }),
+      body: JSON.stringify({ orgName, fullName, email, password, bootstrapToken }),
     });
 
     const data = await res.json();
@@ -57,6 +58,14 @@ export default function SetupForm() {
         <div className="form-group">
           <label>Password</label>
           <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required minLength={8} />
+        </div>
+        <div className="form-group">
+          <label>Bootstrap token</label>
+          <input
+            value={bootstrapToken}
+            onChange={(e) => setBootstrapToken(e.target.value)}
+            placeholder="Required when SETUP_BOOTSTRAP_TOKEN is configured"
+          />
         </div>
         {error && <p className="error">{error}</p>}
         <button className="btn btn-primary" type="submit" disabled={loading} style={{ width: "100%" }}>

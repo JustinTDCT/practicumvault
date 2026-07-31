@@ -30,6 +30,10 @@ export async function GET(
 
   if (!attempt) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
+  if (attempt.organizationId !== session.organizationId) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+
   const isAdmin = session.role === UserRole.ADMIN;
   const isOwner = attempt.candidateId === session.userId;
   if (!isAdmin && !isOwner) {
@@ -48,13 +52,15 @@ export async function GET(
   });
   if (!attempt) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-  const timer = getTimerState(attempt.startedAt, attempt.expiresAt);
+  const endAt = attempt.submittedAt ?? attempt.completedAt ?? undefined;
+  const timer = getTimerState(attempt.startedAt, attempt.expiresAt, endAt ?? undefined);
 
   const response: Record<string, unknown> = {
     attempt: {
       id: attempt.id,
       status: attempt.status,
       startedAt: attempt.startedAt,
+      submittedAt: attempt.submittedAt,
       expiresAt: attempt.expiresAt,
       completedAt: attempt.completedAt,
       currentObjectiveIndex: attempt.currentGateIndex,
@@ -87,6 +93,8 @@ export async function GET(
       developmentAreas: attempt.developmentAreas,
       recommendation: attempt.aiRecommendation,
       adminNotes: attempt.adminNotes,
+      scoringComplete: attempt.scoringComplete,
+      scoringEngineVersion: attempt.scoringEngineVersion,
     };
   }
 
@@ -102,7 +110,9 @@ export async function DELETE(
 
   const { id: attemptId } = await params;
   const attempt = await prisma.attempt.findUnique({ where: { id: attemptId } });
-  if (!attempt) return NextResponse.json({ error: "Not found" }, { status: 404 });
+  if (!attempt || attempt.organizationId !== session.organizationId) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
 
   const isAdmin = session.role === UserRole.ADMIN;
   const isOwner = attempt.candidateId === session.userId;

@@ -1,6 +1,9 @@
 import { AttemptStatus, AssignmentStatus, TemplateStatus } from "@prisma/client";
 import { prisma } from "@/lib/db";
 import { ScenarioTemplateContent, validateTemplateContent } from "@/lib/templates/schema";
+import { getAttemptContent, parseScenarioSnapshot } from "@/lib/attempts/snapshot";
+import { LIMITS } from "@/lib/config/limits";
+import { UnsafeActionRecord } from "@/lib/ai/types";
 
 export interface ObjectiveState {
   objectiveId: number;
@@ -25,6 +28,7 @@ export async function getLatestPublishedVersion(templateId: string) {
 }
 
 export async function getActiveAttemptForCandidate(candidateId: string) {
+  await reconcileExpiredAttemptsForCandidate(candidateId);
   return prisma.attempt.findFirst({
     where: {
       candidateId,
@@ -58,6 +62,11 @@ export function parseTemplateContent(raw: unknown): ScenarioTemplateContent {
   return validateTemplateContent(raw);
 }
 
+export function parseRevealedEvidenceIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((id): id is string => typeof id === "string");
+}
+
 export function computeExpiresAt(startedAt: Date, timeLimitMinutes: number): Date {
   return new Date(startedAt.getTime() + timeLimitMinutes * 60 * 1000);
 }
@@ -66,13 +75,17 @@ export function isAttemptExpired(expiresAt: Date): boolean {
   return new Date() >= expiresAt;
 }
 
+export function isAttemptAcceptingMessages(status: AttemptStatus): boolean {
+  return status === AttemptStatus.IN_PROGRESS;
+}
+
 export async function expireAttemptIfNeeded(attemptId: string) {
   const attempt = await prisma.attempt.findUnique({ where: { id: attemptId } });
   if (!attempt || attempt.status !== AttemptStatus.IN_PROGRESS) return attempt;
 
   if (isAttemptExpired(attempt.expiresAt)) {
     await prisma.attempt.update({
-      where: { id: attemptId },
+      where: { id: attemptId, status: AttemptStatus.IN_PROGRESS },
       data: {
         status: AttemptStatus.TIMED_OUT,
         completedAt: new Date(),
@@ -97,6 +110,33 @@ export async function expireAttemptIfNeeded(attemptId: string) {
   return attempt;
 }
 
+export async function reconcileExpiredAttemptsForCandidate(candidateId: string): Promise<void> {
+  const expired = await prisma.attempt.findMany({
+    where: {
+      candidateId,
+      status: AttemptStatus.IN_PROGRESS,
+      expiresAt: { lte: new Date() },
+    },
+  });
+  for (const attempt of expired) {
+    await expireAttemptIfNeeded(attempt.id);
+  }
+}
+
+export async function reconcileExpiredAttempts(): Promise<number> {
+  const expired = await prisma.attempt.findMany({
+    where: {
+      status: AttemptStatus.IN_PROGRESS,
+      expiresAt: { lte: new Date() },
+    },
+    select: { id: true },
+  });
+  for (const { id } of expired) {
+    await expireAttemptIfNeeded(id);
+  }
+  return expired.length;
+}
+
 export async function abortAttempt(attemptId: string, reason: "candidate" | "admin") {
   const attempt = await prisma.attempt.findUnique({ where: { id: attemptId } });
   if (!attempt || attempt.status !== AttemptStatus.IN_PROGRESS) {
@@ -104,7 +144,7 @@ export async function abortAttempt(attemptId: string, reason: "candidate" | "adm
   }
 
   await prisma.attempt.update({
-    where: { id: attemptId },
+    where: { id: attemptId, status: AttemptStatus.IN_PROGRESS },
     data: {
       status: AttemptStatus.ABORTED,
       completedAt: new Date(),
@@ -147,7 +187,6 @@ export function getTimerState(startedAt: Date, expiresAt: Date, endAt?: Date) {
   };
 }
 
-/** Candidates may start (or retry) unless the assignment was submitted for scoring. */
 export function canCandidateStartAssignment(status: AssignmentStatus): boolean {
   return (
     status === AssignmentStatus.PENDING ||
@@ -193,4 +232,40 @@ export async function allowAssignmentRetake(assignmentId: string, organizationId
     where: { id: assignmentId },
     data: { status: AssignmentStatus.PENDING },
   });
+}
+
+export function getAttemptScenarioContent(attempt: {
+  scenarioSnapshot: unknown;
+  scenarioVersion?: { content: unknown };
+}): ScenarioTemplateContent {
+  return getAttemptContent(attempt);
+}
+
+export function getBoundedTranscript(
+  messages: Array<{ role: string; content: string }>,
+  maxChars = LIMITS.transcriptContextMaxChars,
+): string {
+  const parts = messages.map((m) => `[${m.role.toUpperCase()}] ${m.content}`);
+  let result = "";
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const next = parts[i] + (result ? "\n\n" + result : "");
+    if (next.length > maxChars) break;
+    result = next;
+  }
+  if (!result && parts.length > 0) {
+    result = parts[parts.length - 1].slice(-maxChars);
+  }
+  return result;
+}
+
+export function parseUnsafeActionRecords(raw: unknown): UnsafeActionRecord[] {
+  if (!Array.isArray(raw)) return [];
+  return raw as UnsafeActionRecord[];
+}
+
+export function getSnapshotFromAttempt(attempt: { scenarioSnapshot: unknown }) {
+  if (!attempt.scenarioSnapshot) {
+    throw new Error("Attempt missing scenario snapshot");
+  }
+  return parseScenarioSnapshot(attempt.scenarioSnapshot);
 }

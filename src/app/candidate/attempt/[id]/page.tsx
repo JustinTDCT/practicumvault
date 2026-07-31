@@ -58,6 +58,9 @@ export default function CandidateAttemptPage() {
         timerSettings={timerSettings}
         expiresAt={attempt.expiresAt as string}
         startedAt={attempt.startedAt as string}
+        submittedAt={attempt.submittedAt as string | null | undefined}
+        status={attempt.status as string}
+        completedAt={attempt.completedAt as string | null | undefined}
         onComplete={() => router.push("/candidate/complete")}
         onAbort={async () => {
           await fetch(`/api/attempts/${attemptId}`, { method: "DELETE" });

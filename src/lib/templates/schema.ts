@@ -8,9 +8,11 @@ export const rubricCategorySchema = z.object({
 });
 
 export const unsafeActionSchema = z.object({
+  id: z.string().min(1).optional(),
   description: z.string().min(1),
   penalty: z.number().min(0).max(100),
   keywords: z.array(z.string()).default([]),
+  allowRepeatPenalty: z.boolean().default(false),
 });
 
 export const hintSchema = z.object({

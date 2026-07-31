@@ -1,10 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-import { renderToBuffer } from "@react-pdf/renderer";
-import React from "react";
 import { requireAuth } from "@/lib/auth";
 import { prisma } from "@/lib/db";
-import { buildReportData } from "@/lib/pdf/build-report-data";
-import { AttemptReportDocument } from "@/lib/pdf/report";
+import { rescoreAttempt } from "@/lib/scoring/engine";
 import { UserRole } from "@prisma/client";
 
 export async function GET() {
@@ -43,10 +40,22 @@ export async function PATCH(request: NextRequest) {
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const body = await request.json();
-  const { attemptId, adminNotes } = body;
+  const { attemptId, adminNotes, action } = body;
 
   if (!attemptId) {
     return NextResponse.json({ error: "Attempt ID required" }, { status: 400 });
+  }
+
+  if (action === "rescore") {
+    try {
+      const attempt = await rescoreAttempt(attemptId, session.organizationId);
+      return NextResponse.json({ attempt: { id: attempt?.id, status: attempt?.status, overallScore: attempt?.overallScore } });
+    } catch (err) {
+      return NextResponse.json(
+        { error: err instanceof Error ? err.message : "Rescore failed" },
+        { status: 400 },
+      );
+    }
   }
 
   const attempt = await prisma.attempt.update({

@@ -1,11 +1,14 @@
+# Development-only Compose with convenient defaults and host PostgreSQL access.
 services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
       POSTGRES_USER: practicum
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-practicum}
+      POSTGRES_PASSWORD: practicum
       POSTGRES_DB: practicum_vault
+    ports:
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -22,11 +25,10 @@ services:
     ports:
       - "3000:3000"
     environment:
-      DATABASE_URL: postgresql://practicum:${POSTGRES_PASSWORD}@postgres:5432/practicum_vault?schema=public
-      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
-      SETUP_BOOTSTRAP_TOKEN: ${SETUP_BOOTSTRAP_TOKEN:-}
-      NODE_ENV: production
+      DATABASE_URL: postgresql://practicum:practicum@postgres:5432/practicum_vault?schema=public
+      SESSION_SECRET: ${SESSION_SECRET:-dev-session-secret-change-in-production-min-32-chars}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}
+      NODE_ENV: development
       IN_DOCKER: "true"
     depends_on:
       postgres:
