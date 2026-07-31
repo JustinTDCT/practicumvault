@@ -59,13 +59,17 @@ describe("login limiter (integration)", () => {
   it("success resets account failure state", async () => {
     const email = "candidate@test.local";
     for (let index = 0; index < LIMITS.loginMaxAttempts; index += 1) {
-      await recordLoginAttempt(email, false, null);
+      await recordLoginAttempt(email, false, null, { accountExists: true });
     }
-    expect(await checkLoginRateLimit(email, null)).toMatchObject({ allowed: false });
+    expect(await checkLoginRateLimit(email, null, { accountExists: true })).toMatchObject({
+      allowed: false,
+    });
 
-    await recordLoginAttempt(email, true, null);
+    await recordLoginAttempt(email, true, null, { accountExists: true });
 
-    expect(await checkLoginRateLimit(email, null)).toEqual({ allowed: true });
+    expect(await checkLoginRateLimit(email, null, { accountExists: true })).toEqual({
+      allowed: true,
+    });
     expect(await prisma.loginRateBucket.count()).toBe(0);
     const success = await prisma.loginAttempt.findFirstOrThrow({ where: { success: true } });
     expect(success.email).toBe(email);
@@ -74,13 +78,19 @@ describe("login limiter (integration)", () => {
   it("account windows limit only the failed account", async () => {
     const blockedEmail = "blocked-account@test.local";
     for (let index = 0; index < LIMITS.loginMaxAttempts; index += 1) {
-      await recordLoginAttempt(blockedEmail, false, null);
+      await recordLoginAttempt(blockedEmail, false, null, { accountExists: true });
     }
 
-    expect(await checkLoginRateLimit(blockedEmail, "198.51.100.55")).toMatchObject({
+    expect(
+      await checkLoginRateLimit(blockedEmail, "198.51.100.55", { accountExists: true }),
+    ).toMatchObject({
       allowed: false,
     });
-    expect(await checkLoginRateLimit("other-account@test.local", "198.51.100.55")).toEqual({
+    expect(
+      await checkLoginRateLimit("other-account@test.local", "198.51.100.55", {
+        accountExists: true,
+      }),
+    ).toEqual({
       allowed: true,
     });
   });
@@ -88,13 +98,19 @@ describe("login limiter (integration)", () => {
   it("IP windows limit independently of account windows", async () => {
     const ip = "198.51.100.88";
     for (let index = 0; index < LIMITS.loginMaxAttemptsPerIp; index += 1) {
-      await recordLoginAttempt(`ip-failure-${index}@test.local`, false, ip);
+      await recordLoginAttempt(`ip-failure-${index}@test.local`, false, ip, {
+        accountExists: false,
+      });
     }
 
-    expect(await checkLoginRateLimit("fresh-account@test.local", ip)).toMatchObject({
+    expect(
+      await checkLoginRateLimit("fresh-account@test.local", ip, { accountExists: true }),
+    ).toMatchObject({
       allowed: false,
     });
-    expect(await checkLoginRateLimit("fresh-account@test.local", null)).toEqual({
+    expect(
+      await checkLoginRateLimit("fresh-account@test.local", null, { accountExists: true }),
+    ).toEqual({
       allowed: true,
     });
   });
@@ -121,6 +137,24 @@ describe("login limiter (integration)", () => {
 
     expect(removed).toBeGreaterThanOrEqual(1);
     expect(await prisma.loginRateBucket.count()).toBe(0);
+    expect(await prisma.loginAttempt.count()).toBe(0);
+  });
+
+  it("bounds bucket growth across 1000 distinct nonexistent emails for one IP/window", async () => {
+    const ip = "203.0.113.77";
+    for (let index = 0; index < 1000; index += 1) {
+      await recordLoginAttempt(`nobody-${index}@example.invalid`, false, ip, {
+        accountExists: false,
+      });
+    }
+
+    const buckets = await prisma.loginRateBucket.findMany();
+    expect(buckets.length).toBeLessThanOrEqual(2);
+    expect(buckets.every((b) => b.bucketKey.startsWith("ip:") || b.bucketKey === "anonymous:global")).toBe(
+      true,
+    );
+    expect(buckets.reduce((sum, b) => sum + b.failureCount, 0)).toBe(1000);
+    // No per-email audit rows for unknown accounts
     expect(await prisma.loginAttempt.count()).toBe(0);
   });
 });

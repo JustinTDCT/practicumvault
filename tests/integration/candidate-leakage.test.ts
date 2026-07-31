@@ -29,14 +29,6 @@ vi.mock("@/lib/ai/classifier", async (importOriginal) => {
   };
 });
 
-vi.mock("@/lib/ai/format-evidence", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/ai/format-evidence")>();
-  return {
-    ...actual,
-    generateValidatedDialogue: vi.fn(),
-  };
-});
-
 vi.mock("@/lib/scoring/engine", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/scoring/engine")>();
   return {
@@ -47,7 +39,6 @@ vi.mock("@/lib/scoring/engine", async (importOriginal) => {
 
 import { requireAuth } from "@/lib/auth";
 import { classifyCandidateIntent } from "@/lib/ai/classifier";
-import { generateValidatedDialogue } from "@/lib/ai/format-evidence";
 import { evaluateCurrentObjective } from "@/lib/scoring/engine";
 import { GET as dashboardGET } from "../../src/app/api/candidate/dashboard/route";
 import { POST as startPOST } from "../../src/app/api/attempts/start/route";
@@ -114,7 +105,6 @@ describe("candidate data leakage route coverage (integration)", () => {
     await resetTestDatabase();
     vi.mocked(requireAuth).mockReset();
     vi.mocked(classifyCandidateIntent).mockReset();
-    vi.mocked(generateValidatedDialogue).mockReset();
     vi.mocked(evaluateCurrentObjective).mockReset();
     vi.mocked(evaluateCurrentObjective).mockResolvedValue([]);
   });
@@ -212,7 +202,7 @@ describe("candidate data leakage route coverage (integration)", () => {
     assertNoSecrets(text);
   });
 
-  it("dialogue fallback returns approved facts and never malicious generated coaching", async () => {
+  it("dialogue returns stored approved facts exactly and never invented generative facts", async () => {
     const seeded = await seedOrg("OrgA");
     const content = seeded.content as ScenarioTemplateContent;
     content.actions.push({
@@ -243,11 +233,6 @@ describe("candidate data leakage route coverage (integration)", () => {
       methodOrTool: "call",
       requestedAction: "call user",
     }));
-    vi.mocked(generateValidatedDialogue).mockResolvedValue({
-      text: "APPROVED_DIALOGUE_FACT_OrgA: Selina says only her PC is affected.",
-      usedFallback: true,
-      reason: "prohibited_content",
-    });
     const attemptId = await startAttempt(seeded.assignment.id);
 
     const res = await chat(attemptId, {
@@ -256,9 +241,17 @@ describe("candidate data leakage route coverage (integration)", () => {
     });
     expect(res.status).toBe(200);
     const text = streamText(await res.text());
-    expect(text).toContain("APPROVED_DIALOGUE_FACT_OrgA");
-    expect(text).not.toContain("MALICIOUS_ROOT_CAUSE_COACHING");
+    expect(text).toBe("APPROVED_DIALOGUE_FACT_OrgA: Selina says only her PC is affected.");
+    expect(text).not.toContain("Outlook is also failing");
+    expect(text).not.toContain("after lunch");
     assertNoSecrets(text);
+
+    const events = await prisma.attemptEvent.findMany({
+      where: { attemptId, type: "turn_classified" },
+    });
+    expect(events.some((e) => (e.payload as { dialogueDeterministic?: boolean })?.dialogueDeterministic)).toBe(
+      true,
+    );
   });
 
   it("returns 404 for candidate GET and chat against another organization's attempt", async () => {

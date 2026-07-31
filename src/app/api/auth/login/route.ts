@@ -6,6 +6,14 @@ import { checkLoginRateLimit, recordLoginAttempt, resolveClientIp } from "@/lib/
 
 const GENERIC_ERROR = "Invalid credentials";
 
+/**
+ * Fixed bcrypt hash used when no account exists so password verification
+ * still performs comparable work (reduces account-enumeration timing skew).
+ * Corresponds to a random high-entropy secret, never a real password.
+ */
+const DUMMY_PASSWORD_HASH =
+  "$2b$12$uWcWRjY.cd72HltW.BtuQeJbLHxW6d/ikbrFKtwcMufl20xfGzi6e";
+
 export async function POST(request: NextRequest) {
   const body = await request.json();
   const { email, password } = body;
@@ -14,31 +22,29 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: GENERIC_ERROR }, { status: 400 });
   }
 
-  const normalizedEmail = email.toLowerCase();
+  const normalizedEmail = String(email).toLowerCase();
   const ipAddress = resolveClientIp(request);
-
-  const rateCheck = await checkLoginRateLimit(normalizedEmail, ipAddress);
-  if (!rateCheck.allowed) {
-    return NextResponse.json({ error: GENERIC_ERROR }, { status: 401 });
-  }
 
   const user = await prisma.user.findUnique({
     where: { email: normalizedEmail },
   });
+  const accountExists = Boolean(user?.enabled);
 
-  // Disabled accounts behave like invalid credentials
-  if (!user || !user.enabled) {
-    await recordLoginAttempt(normalizedEmail, false, ipAddress);
+  // Always perform password work (real hash or dummy) before responding.
+  const passwordHash = accountExists && user ? user.passwordHash : DUMMY_PASSWORD_HASH;
+  const validPassword = await verifyPassword(String(password), passwordHash);
+
+  const rateCheck = await checkLoginRateLimit(normalizedEmail, ipAddress, { accountExists });
+  if (!rateCheck.allowed) {
     return NextResponse.json({ error: GENERIC_ERROR }, { status: 401 });
   }
 
-  const valid = await verifyPassword(password, user.passwordHash);
-  if (!valid) {
-    await recordLoginAttempt(normalizedEmail, false, ipAddress);
+  if (!accountExists || !validPassword || !user) {
+    await recordLoginAttempt(normalizedEmail, false, ipAddress, { accountExists });
     return NextResponse.json({ error: GENERIC_ERROR }, { status: 401 });
   }
 
-  await recordLoginAttempt(normalizedEmail, true, ipAddress);
+  await recordLoginAttempt(normalizedEmail, true, ipAddress, { accountExists: true });
   await saveUserSession(user);
 
   return NextResponse.json({ success: true, role: user.role });

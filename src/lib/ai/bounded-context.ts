@@ -13,13 +13,18 @@ export interface BoundedContextResult {
   messages: ContextMessage[];
   truncated: boolean;
   omittedPromptAttackIds: string[];
+  truncatedMessageIds: string[];
+  omittedOversizedIds: string[];
   totalChars: number;
   maxChars: number;
 }
 
+const MESSAGE_OVERHEAD = 16;
+
 /**
  * Select transcript messages by chronological window and character budget.
  * Does not use substring matching. Prompt-attack messages can be omitted from narrative context.
+ * No single message may cause totalChars to exceed maxChars.
  */
 export function selectBoundedEvaluatorContext(
   messages: ContextMessage[],
@@ -40,6 +45,9 @@ export function selectBoundedEvaluatorContext(
   });
 
   const omittedPromptAttackIds: string[] = [];
+  const truncatedMessageIds: string[] = [];
+  const omittedOversizedIds: string[] = [];
+
   const eligible = chronological.filter((m) => {
     if (omitPromptAttacks && m.role === "user" && isPromptAttackMessage(m.content)) {
       omittedPromptAttackIds.push(m.id);
@@ -53,18 +61,47 @@ export function selectBoundedEvaluatorContext(
 
   for (let i = eligible.length - 1; i >= 0; i--) {
     const msg = eligible[i];
-    const cost = msg.content.length + 16;
     if (selected.length >= maxMessages) break;
-    if (totalChars + cost > maxChars && selected.length > 0) break;
-    selected.unshift(msg);
-    totalChars += cost;
+
+    const remaining = maxChars - totalChars;
+    if (remaining <= MESSAGE_OVERHEAD) break;
+
+    const fullCost = msg.content.length + MESSAGE_OVERHEAD;
+    if (fullCost <= remaining) {
+      selected.unshift(msg);
+      totalChars += fullCost;
+      continue;
+    }
+
+    // Oversized relative to remaining budget
+    if (selected.length === 0) {
+      const maxContent = Math.max(0, remaining - MESSAGE_OVERHEAD);
+      selected.unshift({
+        ...msg,
+        content: msg.content.slice(0, maxContent),
+      });
+      totalChars += maxContent + MESSAGE_OVERHEAD;
+      truncatedMessageIds.push(msg.id);
+      break;
+    }
+
+    omittedOversizedIds.push(msg.id);
+    break;
   }
+
+  const truncated =
+    selected.length < eligible.length ||
+    omittedPromptAttackIds.length > 0 ||
+    truncatedMessageIds.length > 0 ||
+    omittedOversizedIds.length > 0;
 
   return {
     messageIds: selected.map((m) => m.id),
     messages: selected,
-    truncated: selected.length < eligible.length || omittedPromptAttackIds.length > 0,
+    truncated,
     omittedPromptAttackIds,
+    truncatedMessageIds,
+    omittedOversizedIds,
     totalChars,
     maxChars,
   };

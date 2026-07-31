@@ -105,11 +105,25 @@ export interface SafeDialogueResult {
   text: string;
   usedFallback: boolean;
   reason: string | null;
+  deterministic: boolean;
 }
 
 /**
- * Generate dialogue completely, validate, then return only safe text.
- * Never streams unvalidated tokens to the candidate.
+ * Production path: return stored approved dialogue exactly.
+ * Never paraphrases or invents facts via a generation model.
+ */
+export function formatDeterministicDialogue(approvedFacts: string): SafeDialogueResult {
+  return {
+    text: approvedFacts.trim(),
+    usedFallback: false,
+    reason: null,
+    deterministic: true,
+  };
+}
+
+/**
+ * Experimental only — not used on the candidate runtime path.
+ * Regex screening alone cannot prove fact integrity; prefer formatDeterministicDialogue.
  */
 export async function generateValidatedDialogue(options: {
   model: LanguageModel;
@@ -133,10 +147,20 @@ Candidate request: ${options.candidateRequest}`,
     });
     const validated = validateDialogueOutput(text, approved, options.maxLength ?? 2000);
     if (!validated.ok) {
-      return { text: validated.text, usedFallback: true, reason: validated.reason };
+      return { text: validated.text, usedFallback: true, reason: validated.reason, deterministic: false };
     }
-    return { text: validated.text, usedFallback: false, reason: null };
+    // Even when regex passes, generative paraphrase is not production-safe.
+    // Fall back to approved facts unless the model returned an exact match.
+    if (validated.text.trim() !== approved) {
+      return {
+        text: approved,
+        usedFallback: true,
+        reason: "invented_or_paraphrased_facts",
+        deterministic: false,
+      };
+    }
+    return { text: validated.text, usedFallback: false, reason: null, deterministic: false };
   } catch {
-    return { text: approved, usedFallback: true, reason: "generation_error" };
+    return { text: approved, usedFallback: true, reason: "generation_error", deterministic: false };
   }
 }

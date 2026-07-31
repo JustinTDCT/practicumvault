@@ -1,31 +1,22 @@
-import { getIronSession, SessionOptions } from "iron-session";
+import "server-only";
+
+import { getIronSession } from "iron-session";
 import { cookies } from "next/headers";
 import { User, UserRole } from "@prisma/client";
 import { prisma } from "@/lib/db";
+import {
+  SessionData,
+  SessionRole,
+  SESSION_COOKIE_NAME,
+  sessionOptions,
+} from "@/lib/session-config";
 
-export interface SessionData {
-  userId: string;
-  email: string;
-  role: UserRole;
-  organizationId: string;
-  sessionVersion: number;
-  isLoggedIn: boolean;
-}
+export type { SessionData, SessionRole };
+export { SESSION_COOKIE_NAME, sessionOptions };
 
 export interface AuthenticatedSession extends SessionData {
   user: User;
 }
-
-export const sessionOptions: SessionOptions = {
-  password: process.env.SESSION_SECRET!,
-  cookieName: "practicum_vault_session",
-  cookieOptions: {
-    secure: process.env.NODE_ENV === "production",
-    httpOnly: true,
-    sameSite: "lax",
-    maxAge: 60 * 60 * 24 * 7,
-  },
-};
 
 export async function getSession() {
   return getIronSession<SessionData>(await cookies(), sessionOptions);
@@ -54,14 +45,19 @@ export async function requireAuth(roles?: UserRole[]): Promise<AuthenticatedSess
     return null;
   }
 
-  return { ...session, sessionVersion: user.sessionVersion, user };
+  return {
+    ...session,
+    role: user.role as SessionRole,
+    sessionVersion: user.sessionVersion,
+    user,
+  };
 }
 
 export async function saveUserSession(user: User): Promise<void> {
   const session = await getSession();
   session.userId = user.id;
   session.email = user.email;
-  session.role = user.role;
+  session.role = user.role as SessionRole;
   session.organizationId = user.organizationId;
   session.sessionVersion = user.sessionVersion;
   session.isLoggedIn = true;

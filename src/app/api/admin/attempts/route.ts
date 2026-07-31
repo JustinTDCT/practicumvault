@@ -103,10 +103,9 @@ export async function PATCH(request: NextRequest) {
         },
       });
     } catch (err) {
-      return NextResponse.json(
-        { error: err instanceof Error ? err.message : "Rescore failed" },
-        { status: 400 },
-      );
+      const { publicScoringErrorBody } = await import("@/lib/scoring/public-error");
+      console.error("[admin] rescore failed", attemptId, err);
+      return NextResponse.json(publicScoringErrorBody(err), { status: 400 });
     }
   }
 

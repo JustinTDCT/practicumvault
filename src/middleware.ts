@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { getIronSession } from "iron-session";
-import { sessionOptions, SessionData } from "@/lib/auth";
+import { sessionOptions, SessionData } from "@/lib/session-config";
 
 const publicPaths = ["/setup", "/login"];
 

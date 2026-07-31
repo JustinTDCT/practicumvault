@@ -18,7 +18,7 @@ import {
 import { validateClassifiedAction } from "@/lib/ai/validate-action";
 import {
   formatDeterministicEvidence,
-  generateValidatedDialogue,
+  formatDeterministicDialogue,
   inferEvidenceFormat,
 } from "@/lib/ai/format-evidence";
 import { TurnStructuredRecord } from "@/lib/ai/types";
@@ -180,8 +180,22 @@ export async function POST(
       await submitAttempt(attemptId);
       return Response.json({ completed: true });
     } catch (err) {
+      const { PublicScoringError, CANDIDATE_SCORING_FAILURE_MESSAGE } = await import(
+        "@/lib/scoring/public-error"
+      );
+      if (err instanceof PublicScoringError) {
+        return Response.json(
+          {
+            completed: true,
+            scoringComplete: false,
+            error: err.publicMessage,
+          },
+          { status: 200 },
+        );
+      }
+      console.error("[chat] submit failed", attemptId, err);
       return Response.json(
-        { error: err instanceof Error ? err.message : "Submission failed" },
+        { error: CANDIDATE_SCORING_FAILURE_MESSAGE },
         { status: 500 },
       );
     }
@@ -270,10 +284,6 @@ export async function POST(
     return Response.json({ error: "Message limit reached for this attempt" }, { status: 429 });
   }
 
-  if (attempt.modelCallsCount >= LIMITS.modelCallsPerAttempt) {
-    return Response.json({ error: "Model call limit reached for this attempt" }, { status: 429 });
-  }
-
   const recentMessages = await prisma.attemptMessage.findMany({
     where: { attemptId, role: "user" },
     orderBy: { createdAt: "desc" },
@@ -325,6 +335,7 @@ export async function POST(
     existingUnsafe,
     userMessage.id,
     model,
+    attemptId,
   );
   if (unsafeRecord) {
     await prisma.attempt.update({
@@ -335,7 +346,6 @@ export async function POST(
           ...(Array.isArray(attempt.unsafeActions) ? (attempt.unsafeActions as string[]) : []),
           unsafeRecord.description,
         ],
-        modelCallsCount: { increment: 1 },
       },
     });
     await prisma.attemptEvent.create({
@@ -347,7 +357,9 @@ export async function POST(
     });
   }
 
-  const rawClassification = await classifyCandidateIntent(model, content, message.trim());
+  const rawClassification = await classifyCandidateIntent(model, content, message.trim(), {
+    attemptId,
+  });
   const validated = validateClassifiedAction(content, rawClassification, message.trim());
   const classification = validated.classification;
   const responseType = resolveResponseType({ ...classification, decision: validated.decision });
@@ -355,6 +367,7 @@ export async function POST(
   let evidenceIds: string[] = [];
   let responseText: string | null = null;
   let dialogueFallback = false;
+  let dialogueDeterministic = false;
 
   if (validated.decision === "VALID_ACTION" && validated.approvedActionId) {
     const matched = content.actions.find((a) => a.id === validated.approvedActionId)!;
@@ -371,13 +384,10 @@ export async function POST(
 
     const format = inferEvidenceFormat(matched.category, matched.label);
     if (format === "dialogue") {
-      const dialogue = await generateValidatedDialogue({
-        model,
-        approvedFacts: selected.evidence,
-        candidateRequest: message.trim(),
-      });
+      const dialogue = formatDeterministicDialogue(selected.evidence);
       responseText = dialogue.text;
       dialogueFallback = dialogue.usedFallback;
+      dialogueDeterministic = dialogue.deterministic;
     } else {
       responseText = formatDeterministicEvidence(
         selected.evidence,
@@ -386,7 +396,7 @@ export async function POST(
       );
     }
   } else if (validated.decision === "REFERENCE_QUESTION") {
-    responseText = await formatReferenceResponse(model, message.trim());
+    responseText = await formatReferenceResponse(model, message.trim(), attemptId);
   } else if (validated.clarification) {
     responseText = validated.clarification;
   } else if (validated.decision === "DELEGATION_REQUEST") {
@@ -439,7 +449,6 @@ export async function POST(
     data: {
       classifierModel: modelLabel,
       responderModel: modelLabel,
-      modelCallsCount: { increment: 1 },
     },
   });
 
@@ -447,7 +456,7 @@ export async function POST(
     data: {
       attemptId,
       type: "turn_classified",
-      payload: { ...turnRecord, turnId, dialogueFallback } as object,
+      payload: { ...turnRecord, turnId, dialogueFallback, dialogueDeterministic } as object,
     },
   });
 
@@ -457,6 +466,7 @@ export async function POST(
     responseType,
     classificationDecision: validated.decision,
     dialogueFallback,
+    dialogueDeterministic,
     turnId,
   });
 

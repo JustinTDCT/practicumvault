@@ -57,5 +57,10 @@ jobs:
       - name: Integration tests
         run: npm run test:integration
 
+      - name: Production dependency audit
+        run: |
+          npm audit --omit=dev --audit-level=high || true
+          node scripts/check-prod-audit.mjs
+
       - name: Build
         run: npm run build

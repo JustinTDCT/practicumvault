@@ -6,6 +6,7 @@ import {
   IntentClassification,
   intentClassificationSchema,
 } from "@/lib/ai/types";
+import { withReservedModelCall } from "@/lib/ai/provider-calls";
 import { ScenarioTemplateContent } from "@/lib/templates/schema";
 
 const classifierOutputSchema = intentClassificationSchema;
@@ -121,12 +122,12 @@ export async function classifyCandidateIntent(
   model: LanguageModel,
   content: ScenarioTemplateContent,
   message: string,
-  options?: { skipAi?: boolean },
+  options?: { skipAi?: boolean; attemptId?: string },
 ): Promise<IntentClassification> {
   const fast = regexFastClassification(message);
   if (fast) return fast;
 
-  if (options?.skipAi) {
+  if (options?.skipAi || !options?.attemptId) {
     return {
       decision: "INCOMPLETE_ACTION",
       targetSystem: null,
@@ -139,10 +140,13 @@ export async function classifyCandidateIntent(
     };
   }
 
-  const { object } = await generateObject({
-    model,
-    schema: classifierOutputSchema,
-    prompt: buildClassifierPrompt(content, message),
+  const object = await withReservedModelCall(options.attemptId, async () => {
+    const result = await generateObject({
+      model,
+      schema: classifierOutputSchema,
+      prompt: buildClassifierPrompt(content, message),
+    });
+    return result.object;
   });
 
   const parsed = classifierOutputSchema.parse(object);

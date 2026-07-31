@@ -6,6 +6,7 @@ vi.mock("ai", () => ({
 
 import { generateText } from "ai";
 import {
+  formatDeterministicDialogue,
   formatDeterministicEvidence,
   generateValidatedDialogue,
   validateDialogueOutput,
@@ -55,10 +56,16 @@ describe("deterministic evidence formatting", () => {
     expect(result.text).toBe(approved);
   });
 
-  it("returns only approved fallback when generated dialogue contains malicious coaching", async () => {
+  it("production dialogue path returns approved text exactly", () => {
+    const approved = "Selina: Only my PC has the issue.";
+    expect(formatDeterministicDialogue(approved).text).toBe(approved);
+    expect(generateText).not.toHaveBeenCalled();
+  });
+
+  it("experimental generative path rejects invented non-prohibited facts", async () => {
     const approved = "Selina: Only my PC has the issue.";
     vi.mocked(generateText).mockResolvedValue({
-      text: "Selina: The root cause is the hosts file. You should check DNS next.",
+      text: "Selina says Outlook is also failing and the problem began after lunch.",
     } as Awaited<ReturnType<typeof generateText>>);
 
     const result = await generateValidatedDialogue({
@@ -67,13 +74,9 @@ describe("deterministic evidence formatting", () => {
       candidateRequest: "Call Selina",
     });
 
-    expect(result).toEqual({
-      text: approved,
-      usedFallback: true,
-      reason: "prohibited_content",
-    });
-    expect(result.text).not.toContain("root cause");
-    expect(result.text).not.toContain("You should");
+    expect(result.text).toBe(approved);
+    expect(result.text).not.toContain("Outlook");
+    expect(result.usedFallback).toBe(true);
   });
 });
 
