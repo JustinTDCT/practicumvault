@@ -37,6 +37,16 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Email already in use" }, { status: 400 });
   }
 
+  if (positionId) {
+    const position = await prisma.position.findFirst({
+      where: { id: positionId, organizationId: session.organizationId },
+      select: { id: true },
+    });
+    if (!position) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+  }
+
   const user = await prisma.user.create({
     data: {
       email: email.toLowerCase(),

@@ -136,10 +136,14 @@ export function ChatInterface({
     ]);
 
     try {
+      const turnId =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `turn-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const res = await fetch(`/api/attempts/${attemptId}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: userMessage }),
+        body: JSON.stringify({ message: userMessage, turnId }),
       });
 
       if (!res.ok) {

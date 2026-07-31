@@ -1,5 +1,5 @@
-import { generateText, streamText } from "ai";
-import { LanguageModel } from "ai";
+import { generateText, streamText, LanguageModel } from "ai";
+import { withReservedModelCall } from "@/lib/ai/provider-calls";
 import { IntentClassification, TurnResponseType } from "@/lib/ai/types";
 import {
   ANSWER_SEEKING_REFUSAL,
@@ -131,12 +131,20 @@ export async function formatEvidenceResponse(
   return text.trim();
 }
 
-export async function formatReferenceResponse(model: LanguageModel, question: string): Promise<string> {
-  const { text } = await generateText({
-    model,
-    prompt: buildReferencePrompt(question),
-  });
-  return text.trim();
+export async function formatReferenceResponse(
+  model: LanguageModel,
+  question: string,
+  attemptId?: string,
+): Promise<string> {
+  const run = async () => {
+    const { text } = await generateText({
+      model,
+      prompt: buildReferencePrompt(question),
+    });
+    return text.trim();
+  };
+  if (!attemptId) return run();
+  return withReservedModelCall(attemptId, run);
 }
 
 export function streamStaticResponse(text: string): Response {

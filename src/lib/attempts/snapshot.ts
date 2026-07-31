@@ -12,6 +12,7 @@ import {
 
 export interface ScenarioAttemptSnapshot {
   templateId: string;
+  templateSlug: string;
   scenarioVersionId: string;
   versionDisplay: string;
   templateTitle: string;
@@ -47,6 +48,7 @@ export function buildScenarioSnapshot(
   const content = validateTemplateContent(version.content);
   return {
     templateId: template.id,
+    templateSlug: template.slug,
     scenarioVersionId: version.id,
     versionDisplay: version.version,
     templateTitle: template.title,
@@ -67,37 +69,45 @@ export function parseScenarioSnapshot(raw: unknown): ScenarioAttemptSnapshot {
     throw new Error("Attempt is missing scenario snapshot");
   }
   const snap = raw as ScenarioAttemptSnapshot;
+  if (!snap.templateTitle || !snap.scenarioVersionId) {
+    throw new Error("Attempt snapshot is incomplete or invalid");
+  }
   return {
     ...snap,
+    templateSlug: snap.templateSlug || "",
     content: validateTemplateContent(snap.content),
   };
 }
 
 export function getAttemptContent(attempt: {
   scenarioSnapshot: unknown;
-  scenarioVersion?: { content: unknown; template?: { title: string } };
 }): ScenarioTemplateContent {
-  if (attempt.scenarioSnapshot) {
-    return parseScenarioSnapshot(attempt.scenarioSnapshot).content;
+  if (!attempt.scenarioSnapshot) {
+    throw new Error("Attempt snapshot required — run snapshot backfill");
   }
-  if (attempt.scenarioVersion?.content) {
-    return validateTemplateContent(attempt.scenarioVersion.content);
-  }
-  throw new Error("No scenario content available for attempt");
+  return parseScenarioSnapshot(attempt.scenarioSnapshot).content;
 }
 
 export function getAttemptSnapshot(attempt: {
   scenarioSnapshot: unknown;
-  scenarioVersion?: ScenarioVersion & { template?: ScenarioTemplate };
-  organization?: Organization;
 }): ScenarioAttemptSnapshot {
-  if (attempt.scenarioSnapshot) {
-    return parseScenarioSnapshot(attempt.scenarioSnapshot);
+  if (!attempt.scenarioSnapshot) {
+    throw new Error("Attempt snapshot required — run snapshot backfill");
   }
-  if (attempt.scenarioVersion && attempt.organization) {
-    const template = attempt.scenarioVersion.template;
-    if (!template) throw new Error("Template required to build legacy snapshot");
-    return buildScenarioSnapshot(template, attempt.scenarioVersion, attempt.organization);
+  return parseScenarioSnapshot(attempt.scenarioSnapshot);
+}
+
+export class SnapshotIntegrityError extends Error {
+  constructor(message = "Historical scenario snapshot is missing or invalid. Run snapshot backfill.") {
+    super(message);
+    this.name = "SnapshotIntegrityError";
   }
-  throw new Error("No scenario snapshot available for attempt");
+}
+
+export function requireAttemptSnapshot(attempt: { scenarioSnapshot: unknown }): ScenarioAttemptSnapshot {
+  try {
+    return getAttemptSnapshot(attempt);
+  } catch (err) {
+    throw new SnapshotIntegrityError(err instanceof Error ? err.message : undefined);
+  }
 }

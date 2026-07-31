@@ -2,11 +2,23 @@ const PLACEHOLDER_PATTERNS = [
   /^change-me/i,
   /^dev-session-secret/i,
   /^0123456789abcdef0123456789abcdef$/,
+  /^0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef$/i,
+  /^0{64}$/,
+  /^(.)\1{63}$/,
   /^practicum$/,
 ];
 
 function isPlaceholder(value: string): boolean {
   return PLACEHOLDER_PATTERNS.some((p) => p.test(value));
+}
+
+function isWeakHexKey(value: string): boolean {
+  if (/^0{64}$/.test(value)) return true;
+  if (/^(.)\1{63}$/.test(value)) return true;
+  if (/^0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef$/i.test(value)) {
+    return true;
+  }
+  return false;
 }
 
 function validateHexKey(name: string, value: string | undefined, required: boolean): void {
@@ -21,6 +33,9 @@ function validateHexKey(name: string, value: string | undefined, required: boole
       `${name} must be exactly 64 hexadecimal characters (32 bytes). Generate with: openssl rand -hex 32`,
     );
   }
+  if (isWeakHexKey(value) || isPlaceholder(value)) {
+    throw new Error(`${name} must not use a weak or documented development value`);
+  }
 }
 
 function validateSessionSecret(value: string | undefined, required: boolean): void {
@@ -32,6 +47,9 @@ function validateSessionSecret(value: string | undefined, required: boolean): vo
   }
   if (value.length < 32) {
     throw new Error("SESSION_SECRET must be at least 32 characters");
+  }
+  if (isPlaceholder(value)) {
+    throw new Error("SESSION_SECRET must not use a known placeholder");
   }
 }
 
@@ -69,11 +87,8 @@ export function validateEnvironment(): void {
   validateDatabaseUrl(process.env.DATABASE_URL, requireStrict);
 
   if (requireStrict) {
-    if (isPlaceholder(process.env.SESSION_SECRET ?? "")) {
-      throw new Error("SESSION_SECRET must not use a known placeholder in production");
-    }
-    if (isPlaceholder(process.env.ENCRYPTION_KEY ?? "")) {
-      throw new Error("ENCRYPTION_KEY must not use a known placeholder in production");
+    if (process.env.POSTGRES_PASSWORD && isPlaceholder(process.env.POSTGRES_PASSWORD)) {
+      throw new Error("POSTGRES_PASSWORD must not use a known placeholder in production");
     }
   }
 

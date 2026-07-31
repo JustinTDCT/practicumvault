@@ -1,4 +1,3 @@
-import { redirect } from "next/navigation";
 import { ensureSetup } from "@/lib/setup";
 
 export const dynamic = "force-dynamic";

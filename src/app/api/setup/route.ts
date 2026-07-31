@@ -5,12 +5,9 @@ import { saveUserSession } from "@/lib/auth";
 import { requireBootstrapToken } from "@/lib/config/env";
 import { UserRole } from "@prisma/client";
 
-export async function POST(request: NextRequest) {
-  const existing = await prisma.organization.findFirst();
-  if (existing?.setupComplete) {
-    return NextResponse.json({ error: "Setup already completed" }, { status: 400 });
-  }
+const SETUP_LOCK_KEY = 724531; // advisory lock key for initial setup
 
+export async function POST(request: NextRequest) {
   const body = await request.json();
   const { orgName, fullName, email, password, bootstrapToken } = body;
 
@@ -31,8 +28,10 @@ export async function POST(request: NextRequest) {
 
   try {
     const result = await prisma.$transaction(async (tx) => {
-      const orgExists = await tx.organization.findFirst({ where: { setupComplete: true } });
-      if (orgExists) {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${SETUP_LOCK_KEY})`;
+
+      const orgCount = await tx.organization.count();
+      if (orgCount > 0) {
         throw new Error("SETUP_COMPLETE");
       }
 
