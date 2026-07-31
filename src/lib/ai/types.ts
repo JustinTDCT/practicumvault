@@ -14,14 +14,34 @@ export const classificationDecisionSchema = z.enum([
 
 export type ClassificationDecision = z.infer<typeof classificationDecisionSchema>;
 
+/** Schema for generateObject — no z.record(), no .default(), all fields required. */
+export const classifierGenerationSchema = z.object({
+  decision: classificationDecisionSchema,
+  targetSystem: z.string().nullable(),
+  methodOrTool: z.string().nullable(),
+  requestedAction: z.string().nullable(),
+  parameters: z.array(
+    z.object({
+      name: z.string(),
+      value: z.string(),
+    }),
+  ),
+  matchedActionId: z.string().nullable(),
+  missingFields: z.array(z.string()),
+  reasoning: z.string(),
+});
+
+export type ClassifierGeneration = z.infer<typeof classifierGenerationSchema>;
+
+/** Normalized app-facing classification (parameters as a string map). */
 export const intentClassificationSchema = z.object({
   decision: classificationDecisionSchema,
   targetSystem: z.string().nullable(),
   methodOrTool: z.string().nullable(),
   requestedAction: z.string().nullable(),
-  parameters: z.record(z.string()).default({}),
+  parameters: z.record(z.string()),
   matchedActionId: z.string().nullable(),
-  missingFields: z.array(z.string()).default([]),
+  missingFields: z.array(z.string()),
   reasoning: z.string(),
 });
 

@@ -455,6 +455,7 @@ export async function POST(
 
     const rawClassification = await classifyCandidateIntent(model, content, message.trim(), {
       attemptId,
+      correlationId: turnId,
     });
     const validated = validateClassifiedAction(content, rawClassification, message.trim());
     const classification = validated.classification;
