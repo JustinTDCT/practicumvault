@@ -1,0 +1,13 @@
+node_modules
+.next
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+README.md
+*.md
+.DS_Store
+npm-debug.log*
+.cursor
+terminals

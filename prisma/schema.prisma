@@ -1,0 +1,239 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  CANDIDATE
+}
+
+enum LlmProvider {
+  ANTHROPIC
+  OPENAI
+  LOCAL
+}
+
+enum TemplateStatus {
+  DRAFT
+  PUBLISHED
+  DISABLED
+}
+
+enum AssignmentStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  ABORTED
+  TIMED_OUT
+}
+
+enum AttemptStatus {
+  IN_PROGRESS
+  COMPLETED
+  ABORTED
+  TIMED_OUT
+}
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  setupComplete Boolean @default(false) @map("setup_complete")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  showCountdownTimer Boolean @default(true) @map("show_countdown_timer")
+  showElapsedTimer   Boolean @default(true) @map("show_elapsed_timer")
+
+  llmProvider       LlmProvider @default(OPENAI) @map("llm_provider")
+  anthropicApiKey   String?     @map("anthropic_api_key")
+  openaiApiKey      String?     @map("openai_api_key")
+  localLlmBaseUrl   String?     @map("local_llm_base_url")
+  anthropicModel    String      @default("claude-sonnet-4-20250514") @map("anthropic_model")
+  openaiModel       String      @default("gpt-4o") @map("openai_model")
+  localLlmModel     String      @default("llama3.2") @map("local_llm_model")
+
+  users              User[]
+  positions          Position[]
+  scenarioTemplates  ScenarioTemplate[]
+  assignments        Assignment[]
+  attempts           Attempt[]
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  fullName     String   @map("full_name")
+  role         UserRole
+  isPrimaryAdmin Boolean @default(false) @map("is_primary_admin")
+  enabled      Boolean  @default(true)
+  notes        String   @default("")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  organizationId String       @map("organization_id")
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  positionId String?   @map("position_id")
+  position   Position? @relation(fields: [positionId], references: [id])
+
+  assignmentsCreated Assignment[] @relation("AssignedBy")
+  assignments        Assignment[] @relation("CandidateAssignments")
+  attempts           Attempt[]
+
+  @@index([organizationId])
+  @@index([role])
+}
+
+model Position {
+  id          String   @id @default(cuid())
+  name        String
+  description String   @default("")
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  organizationId String       @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  users       User[]
+  assignments Assignment[]
+
+  @@unique([organizationId, name])
+}
+
+model ScenarioTemplate {
+  id          String   @id @default(cuid())
+  slug        String
+  title       String
+  description String   @default("")
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  organizationId String       @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  versions ScenarioVersion[]
+
+  @@unique([organizationId, slug])
+}
+
+model ScenarioVersion {
+  id              String         @id @default(cuid())
+  version         String
+  status          TemplateStatus @default(DRAFT)
+  timeLimitMinutes Int           @map("time_limit_minutes")
+  content         Json
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+  publishedAt     DateTime?      @map("published_at")
+
+  templateId String           @map("template_id")
+  template   ScenarioTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  assignments Assignment[]
+  attempts    Attempt[]
+
+  @@unique([templateId, version])
+  @@index([status])
+}
+
+model Assignment {
+  id        String           @id @default(cuid())
+  status    AssignmentStatus @default(PENDING)
+  notes     String           @default("")
+  createdAt DateTime         @default(now()) @map("created_at")
+  updatedAt DateTime         @updatedAt @map("updated_at")
+
+  organizationId String       @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  candidateId String @map("candidate_id")
+  candidate   User   @relation("CandidateAssignments", fields: [candidateId], references: [id], onDelete: Cascade)
+
+  assignedById String @map("assigned_by_id")
+  assignedBy   User   @relation("AssignedBy", fields: [assignedById], references: [id])
+
+  scenarioVersionId String          @map("scenario_version_id")
+  scenarioVersion   ScenarioVersion @relation(fields: [scenarioVersionId], references: [id])
+
+  positionId String?   @map("position_id")
+  position   Position? @relation(fields: [positionId], references: [id])
+
+  attempts Attempt[]
+
+  @@index([candidateId, status])
+}
+
+model Attempt {
+  id        String        @id @default(cuid())
+  status    AttemptStatus @default(IN_PROGRESS)
+  startedAt DateTime      @default(now()) @map("started_at")
+  completedAt DateTime?   @map("completed_at")
+  expiresAt DateTime      @map("expires_at")
+
+  currentGateIndex Int @default(0) @map("current_gate_index")
+  hintsUsed        Int @default(0) @map("hints_used")
+  hintsPenalty     Int @default(0) @map("hints_penalty")
+  unsafeActions    Json @default("[]") @map("unsafe_actions")
+
+  gateStates     Json @default("[]") @map("gate_states")
+  scoreBreakdown Json? @map("score_breakdown")
+  overallScore   Int?
+  aiRecommendation String? @map("ai_recommendation")
+  strengths        String?
+  developmentAreas String? @map("development_areas")
+  adminNotes       String  @default("") @map("admin_notes")
+
+  scoringComplete Boolean @default(false) @map("scoring_complete")
+
+  organizationId String       @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  assignmentId String     @map("assignment_id")
+  assignment   Assignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+
+  candidateId String @map("candidate_id")
+  candidate   User   @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+
+  scenarioVersionId String          @map("scenario_version_id")
+  scenarioVersion   ScenarioVersion @relation(fields: [scenarioVersionId], references: [id])
+
+  messages AttemptMessage[]
+  events   AttemptEvent[]
+
+  @@index([status])
+  @@index([candidateId])
+  @@index([startedAt])
+}
+
+model AttemptMessage {
+  id        String   @id @default(cuid())
+  role      String
+  content   String   @db.Text
+  metadata  Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  attemptId String  @map("attempt_id")
+  attempt   Attempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+
+  @@index([attemptId, createdAt])
+}
+
+model AttemptEvent {
+  id        String   @id @default(cuid())
+  type      String
+  payload   Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  attemptId String  @map("attempt_id")
+  attempt   Attempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+
+  @@index([attemptId, createdAt])
+}

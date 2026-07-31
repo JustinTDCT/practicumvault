@@ -1,0 +1,196 @@
+import { AttemptStatus, AssignmentStatus, TemplateStatus } from "@prisma/client";
+import { prisma } from "@/lib/db";
+import { ScenarioTemplateContent, validateTemplateContent } from "@/lib/templates/schema";
+
+export interface ObjectiveState {
+  objectiveId: number;
+  passed: boolean;
+  attempts: number;
+  lastEvaluatedAt?: string;
+  reasoning?: string;
+}
+
+/** @deprecated Use ObjectiveState */
+export type GateState = ObjectiveState;
+
+export async function getOrganization() {
+  return prisma.organization.findFirst();
+}
+
+export async function getLatestPublishedVersion(templateId: string) {
+  return prisma.scenarioVersion.findFirst({
+    where: { templateId, status: TemplateStatus.PUBLISHED },
+    orderBy: { publishedAt: "desc" },
+  });
+}
+
+export async function getActiveAttemptForCandidate(candidateId: string) {
+  return prisma.attempt.findFirst({
+    where: {
+      candidateId,
+      status: AttemptStatus.IN_PROGRESS,
+    },
+    include: {
+      scenarioVersion: { include: { template: true } },
+      assignment: true,
+    },
+  });
+}
+
+export function parseObjectiveStates(raw: unknown): ObjectiveState[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((item) => {
+    const row = item as Record<string, unknown>;
+    return {
+      objectiveId: Number(row.objectiveId ?? row.gateId),
+      passed: Boolean(row.passed),
+      attempts: Number(row.attempts ?? 0),
+      lastEvaluatedAt: row.lastEvaluatedAt as string | undefined,
+      reasoning: row.reasoning as string | undefined,
+    };
+  });
+}
+
+/** @deprecated Use parseObjectiveStates */
+export const parseGateStates = parseObjectiveStates;
+
+export function parseTemplateContent(raw: unknown): ScenarioTemplateContent {
+  return validateTemplateContent(raw);
+}
+
+export function computeExpiresAt(startedAt: Date, timeLimitMinutes: number): Date {
+  return new Date(startedAt.getTime() + timeLimitMinutes * 60 * 1000);
+}
+
+export function isAttemptExpired(expiresAt: Date): boolean {
+  return new Date() >= expiresAt;
+}
+
+export async function expireAttemptIfNeeded(attemptId: string) {
+  const attempt = await prisma.attempt.findUnique({ where: { id: attemptId } });
+  if (!attempt || attempt.status !== AttemptStatus.IN_PROGRESS) return attempt;
+
+  if (isAttemptExpired(attempt.expiresAt)) {
+    await prisma.attempt.update({
+      where: { id: attemptId },
+      data: {
+        status: AttemptStatus.TIMED_OUT,
+        completedAt: new Date(),
+        overallScore: 0,
+        scoringComplete: true,
+        aiRecommendation: "Timed out — session invalid. Candidate must start a new attempt.",
+      },
+    });
+    await prisma.assignment.update({
+      where: { id: attempt.assignmentId },
+      data: { status: AssignmentStatus.TIMED_OUT },
+    });
+    await prisma.attemptEvent.create({
+      data: {
+        attemptId,
+        type: "timed_out",
+        payload: { at: new Date().toISOString() },
+      },
+    });
+    return prisma.attempt.findUnique({ where: { id: attemptId } });
+  }
+  return attempt;
+}
+
+export async function abortAttempt(attemptId: string, reason: "candidate" | "admin") {
+  const attempt = await prisma.attempt.findUnique({ where: { id: attemptId } });
+  if (!attempt || attempt.status !== AttemptStatus.IN_PROGRESS) {
+    throw new Error("Attempt is not in progress.");
+  }
+
+  await prisma.attempt.update({
+    where: { id: attemptId },
+    data: {
+      status: AttemptStatus.ABORTED,
+      completedAt: new Date(),
+      overallScore: 0,
+      scoringComplete: true,
+      aiRecommendation: `Aborted by ${reason} — session invalid. Score: 0.`,
+    },
+  });
+  await prisma.assignment.update({
+    where: { id: attempt.assignmentId },
+    data: { status: AssignmentStatus.ABORTED },
+  });
+  await prisma.attemptEvent.create({
+    data: {
+      attemptId,
+      type: "aborted",
+      payload: { by: reason, at: new Date().toISOString() },
+    },
+  });
+}
+
+export function formatDuration(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+export function getTimerState(startedAt: Date, expiresAt: Date, endAt?: Date) {
+  const now = endAt ?? new Date();
+  const elapsedMs = Math.max(0, now.getTime() - startedAt.getTime());
+  const remainingMs = Math.max(0, expiresAt.getTime() - now.getTime());
+  return {
+    elapsedMs,
+    remainingMs,
+    elapsedFormatted: formatDuration(elapsedMs),
+    remainingFormatted: formatDuration(remainingMs),
+    expired: remainingMs <= 0,
+    frozen: Boolean(endAt),
+  };
+}
+
+/** Candidates may start (or retry) unless the assignment was submitted for scoring. */
+export function canCandidateStartAssignment(status: AssignmentStatus): boolean {
+  return (
+    status === AssignmentStatus.PENDING ||
+    status === AssignmentStatus.ABORTED ||
+    status === AssignmentStatus.TIMED_OUT
+  );
+}
+
+export function assignmentStartBlockedReason(status: AssignmentStatus): string | null {
+  if (status === AssignmentStatus.COMPLETED) {
+    return "This assessment has been submitted for scoring. Contact your administrator if you need another attempt.";
+  }
+  if (status === AssignmentStatus.IN_PROGRESS) {
+    return "This assignment already has an active session in progress.";
+  }
+  if (!canCandidateStartAssignment(status)) {
+    return "This assignment is not available to start.";
+  }
+  return null;
+}
+
+export async function allowAssignmentRetake(assignmentId: string, organizationId: string) {
+  const assignment = await prisma.assignment.findUnique({
+    where: { id: assignmentId },
+    include: {
+      attempts: { where: { status: AttemptStatus.IN_PROGRESS }, take: 1 },
+    },
+  });
+
+  if (!assignment || assignment.organizationId !== organizationId) {
+    throw new Error("Assignment not found");
+  }
+
+  if (assignment.status !== AssignmentStatus.COMPLETED) {
+    throw new Error("Only submitted (completed) assignments can be reopened for a retake");
+  }
+
+  if (assignment.attempts.length > 0) {
+    throw new Error("Candidate still has an active attempt on this assignment");
+  }
+
+  return prisma.assignment.update({
+    where: { id: assignmentId },
+    data: { status: AssignmentStatus.PENDING },
+  });
+}

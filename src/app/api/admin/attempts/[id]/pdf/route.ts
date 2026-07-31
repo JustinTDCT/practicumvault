@@ -1,0 +1,42 @@
+import { NextRequest, NextResponse } from "next/server";
+import { renderToBuffer } from "@react-pdf/renderer";
+import React from "react";
+import { requireAuth } from "@/lib/auth";
+import { prisma } from "@/lib/db";
+import { buildReportData } from "@/lib/pdf/build-report-data";
+import { AttemptReportDocument } from "@/lib/pdf/report";
+import { UserRole } from "@prisma/client";
+
+export async function GET(
+  _request: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  const session = await requireAuth([UserRole.ADMIN]);
+  if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  const { id } = await params;
+
+  const attempt = await prisma.attempt.findUnique({
+    where: { id, organizationId: session.organizationId },
+    include: {
+      candidate: true,
+      scenarioVersion: { include: { template: true } },
+      assignment: { include: { position: true } },
+    },
+  });
+
+  if (!attempt) return NextResponse.json({ error: "Not found" }, { status: 404 });
+
+  const reportData = buildReportData(attempt);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const buffer = await renderToBuffer(
+    React.createElement(AttemptReportDocument, { data: reportData }) as any,
+  );
+
+  return new NextResponse(new Uint8Array(buffer), {
+    headers: {
+      "Content-Type": "application/pdf",
+      "Content-Disposition": `attachment; filename="practicum-report-${attempt.id}.pdf"`,
+    },
+  });
+}
