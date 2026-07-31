@@ -8,6 +8,9 @@ export type SafeLogFields = {
   errorName?: string;
   retryable?: boolean;
   correlationId?: string;
+  finishReason?: string;
+  causeName?: string;
+  responseModel?: string;
 };
 
 export function logSafeError(scope: string, fields: SafeLogFields): void {
@@ -19,6 +22,9 @@ export function logSafeError(scope: string, fields: SafeLogFields): void {
       errorName: fields.errorName ?? null,
       retryable: fields.retryable ?? null,
       correlationId: fields.correlationId ?? null,
+      finishReason: fields.finishReason ?? null,
+      causeName: fields.causeName ?? null,
+      responseModel: fields.responseModel ?? null,
     }),
   );
 }

@@ -1,15 +1,15 @@
-import { generateObject } from "ai";
-import { LanguageModel } from "ai";
+import { generateObject, NoObjectGeneratedError, LanguageModel } from "ai";
 import { detectCheatAttempt } from "@/lib/ai/cheat-detection";
 import {
   ClassificationDecision,
+  ClassifierGeneration,
   IntentClassification,
+  classifierGenerationSchema,
   intentClassificationSchema,
 } from "@/lib/ai/types";
 import { withReservedModelCall } from "@/lib/ai/provider-calls";
 import { ScenarioTemplateContent } from "@/lib/templates/schema";
-
-const classifierOutputSchema = intentClassificationSchema;
+import { logSafeError } from "@/lib/security/safe-log";
 
 function buildClassifierPrompt(content: ScenarioTemplateContent, message: string): string {
   const actionsList = content.actions
@@ -31,6 +31,7 @@ Classify into exactly one decision:
 
 For VALID_ACTION, set matchedActionId when candidate intent clearly matches a predefined action ID.
 Set missingFields to names of missing specifics (e.g. "targetSystem", "methodOrTool", "objectOrParameters").
+Represent parameters as an array of { name, value } objects (use [] when none).
 Never include hidden scenario facts in reasoning.
 
 Predefined actions:
@@ -118,47 +119,95 @@ export function findMatchingAction(content: ScenarioTemplateContent, message: st
   return null;
 }
 
+export function normalizeClassifierOutput(generated: ClassifierGeneration): IntentClassification {
+  const parameters = Object.fromEntries(generated.parameters.map(({ name, value }) => [name, value]));
+  return intentClassificationSchema.parse({
+    ...generated,
+    parameters,
+  });
+}
+
+function incompleteActionFallback(
+  content: ScenarioTemplateContent,
+  message: string,
+  reasoning: string,
+): IntentClassification {
+  return {
+    decision: "INCOMPLETE_ACTION",
+    targetSystem: null,
+    methodOrTool: null,
+    requestedAction: message.trim(),
+    parameters: {},
+    matchedActionId: findMatchingAction(content, message),
+    missingFields: ["methodOrTool"],
+    reasoning,
+  };
+}
+
 export async function classifyCandidateIntent(
   model: LanguageModel,
   content: ScenarioTemplateContent,
   message: string,
-  options?: { skipAi?: boolean; attemptId?: string },
+  options?: { skipAi?: boolean; attemptId?: string; correlationId?: string },
 ): Promise<IntentClassification> {
   const fast = regexFastClassification(message);
   if (fast) return fast;
 
   if (options?.skipAi || !options?.attemptId) {
-    return {
-      decision: "INCOMPLETE_ACTION",
-      targetSystem: null,
-      methodOrTool: null,
-      requestedAction: message.trim(),
-      parameters: {},
-      matchedActionId: findMatchingAction(content, message),
-      missingFields: ["methodOrTool"],
-      reasoning: "fallback: no AI classifier",
-    };
+    return incompleteActionFallback(content, message, "fallback: no AI classifier");
   }
 
-  const object = await withReservedModelCall(options.attemptId, async () => {
-    const result = await generateObject({
-      model,
-      schema: classifierOutputSchema,
-      prompt: buildClassifierPrompt(content, message),
+  try {
+    const object = await withReservedModelCall(options.attemptId, async () => {
+      const result = await generateObject({
+        model,
+        mode: "json",
+        schemaName: "candidate_intent",
+        schema: classifierGenerationSchema,
+        temperature: 0,
+        prompt: buildClassifierPrompt(content, message),
+      });
+      return result.object;
     });
-    return result.object;
-  });
 
-  const parsed = classifierOutputSchema.parse(object);
+    const parsed = normalizeClassifierOutput(object);
 
-  if (parsed.decision === "VALID_ACTION" && !parsed.matchedActionId) {
-    const matched = findMatchingAction(content, message);
-    if (matched) {
-      parsed.matchedActionId = matched;
+    if (parsed.decision === "VALID_ACTION" && !parsed.matchedActionId) {
+      const matched = findMatchingAction(content, message);
+      if (matched) {
+        parsed.matchedActionId = matched;
+      }
     }
-  }
 
-  return parsed;
+    return parsed;
+  } catch (error) {
+    if (NoObjectGeneratedError.isInstance(error)) {
+      const causeName =
+        error.cause instanceof Error
+          ? error.cause.name
+          : error.cause != null
+            ? typeof error.cause
+            : null;
+
+      logSafeError("classifier.no_object", {
+        category: "structured_output_invalid",
+        errorName: error.name,
+        attemptId: options.attemptId,
+        correlationId: options.correlationId,
+        finishReason: error.finishReason ?? undefined,
+        causeName: causeName ?? undefined,
+        responseModel: error.response?.modelId,
+      });
+
+      return incompleteActionFallback(
+        content,
+        message,
+        "fallback: structured classifier output invalid",
+      );
+    }
+
+    throw error;
+  }
 }
 
 export function deriveClarificationQuestion(classification: IntentClassification): string {
