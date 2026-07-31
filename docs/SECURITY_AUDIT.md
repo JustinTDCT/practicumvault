@@ -4,26 +4,30 @@ Command:
 
 ```bash
 npm audit --omit=dev
-npm audit --omit=dev --audit-level=high
+node scripts/check-prod-audit.mjs
 ```
 
 Do **not** run `npm audit fix --force` automatically — npm proposes regressing `next` to 9.x or jumping AI SDK to v7, both breaking.
 
-## Classification of current production findings
+## Accepted advisories (exact)
 
-| Package | Severity | Direct / transitive | Prod / dev | Currently exploitable here? | Action |
-|---|---|---|---|---|---|
-| `postcss` (via `next`) | high | transitive | production | **Not applicable** for this app’s threat model: advisories concern attacker-controlled CSS stringify / source-map loading during CSS processing. Candidate/admin content is not fed through PostCSS as untrusted stylesheets. | Requires `next` major upgrade path that vendors a fixed `postcss`. Blocked pending Next.js release that pulls `postcss > 8.5.17` without a forced downgrade. |
-| `sharp` (via `next`) | high | transitive | production | **Not applicable** in default deployment: sharp is used by Next image optimization for local assets. We do not process attacker-uploaded images through sharp. | Requires Next.js bump that depends on `sharp >= 0.35.0`. |
-| `next` | high (inherited) | direct | production | Inherited from `postcss` / `sharp` only. | Stay on Next 15.x until a nonbreaking patch ships fixed deps; Next 16 is a separate upgrade project. |
-| `@ai-sdk/provider-utils` / `@ai-sdk/*` / `ai` | low (resource consumption advisory in audit tree) | direct + transitive | production | Low severity in `--omit=dev` report; fix requires `ai@7` breaking change. | Defer AI SDK major upgrade. Track separately. |
-| `jsondiffpatch` (via `ai`) | moderate | transitive | production | XSS in HTML formatter — not used to render untrusted HTML in this app. | Defer with AI SDK upgrade. |
+Allowlist is by **advisory URL / GHSA id**, not package name:
+
+| Advisory | Package | Notes |
+|---|---|---|
+| https://github.com/advisories/GHSA-qx2v-qp2m-jg93 | postcss | XSS via CSS stringify — not applicable (no untrusted CSS pipeline) |
+| https://github.com/advisories/GHSA-6g55-p6wh-862q | postcss | sourceMappingURL disclosure — not applicable |
+| https://github.com/advisories/GHSA-r28c-9q8g-f849 | postcss | source map path traversal — not applicable |
+| https://github.com/advisories/GHSA-f88m-g3jw-g9cj | sharp | libvips CVEs — not applicable (no attacker image uploads via sharp) |
+
+`next` high severity is accepted **only** when its complete `via` chain is string references to `postcss` and/or `sharp` (no direct Next.js advisory objects).
 
 ## Build policy
 
-CI runs `npm audit --omit=dev --audit-level=high` through `scripts/check-prod-audit.mjs`.
+* Any **critical** advisory fails.
+* Any high/critical on an unexpected package fails.
+* A new PostCSS/Sharp advisory URL fails.
+* A direct Next.js advisory object fails.
+* Malformed audit JSON fails closed.
 
-* **Allowed:** only the documented accepted package names above (`postcss`, `sharp`, `next`).
-* **Blocked:** any other production high/critical advisory.
-
-Safe nonbreaking updates were attempted (`npm audit fix --omit=dev`); none cleared the high findings without `--force`.
+Policy implementation: `scripts/audit-policy.mjs` (tested by fixtures).

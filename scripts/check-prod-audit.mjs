@@ -1,45 +1,58 @@
 #!/usr/bin/env node
 /**
- * Runs npm audit --omit=dev and fails only on unexpected production high/critical advisories.
+ * Production audit gate.
+ * Accepted findings are identified by exact advisory URL / GHSA id — not package name alone.
  * See docs/SECURITY_AUDIT.md.
  */
 import { execSync } from "node:child_process";
+import { evaluateProductionAudit, ACCEPTED_ADVISORY_URLS } from "./audit-policy.mjs";
 
-const ACCEPTED_HIGH = new Set(["postcss", "sharp", "next"]);
-
-let raw;
-try {
-  raw = execSync("npm audit --omit=dev --json", {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-} catch (err) {
-  raw = err.stdout?.toString?.() || "";
-  if (!raw) {
-    console.error("npm audit failed without JSON output");
-    process.exit(1);
+function loadAuditJson() {
+  try {
+    return execSync("npm audit --omit=dev --json", {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (err) {
+    const raw = err.stdout?.toString?.() || "";
+    if (!raw) {
+      throw new Error("npm audit failed without JSON output");
+    }
+    return raw;
   }
 }
 
-const report = JSON.parse(raw);
-const vulns = report.vulnerabilities || {};
-const highs = Object.values(vulns).filter(
-  (v) => v.severity === "high" || v.severity === "critical",
-);
+function main() {
+  let report;
+  try {
+    const raw = loadAuditJson();
+    report = JSON.parse(raw);
+  } catch (err) {
+    console.error("Malformed or incomplete audit JSON — failing closed.");
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
 
-const unexpected = highs.filter((v) => !ACCEPTED_HIGH.has(v.name));
+  const result = evaluateProductionAudit(report);
+  console.log(`Accepted advisory allowlist (${ACCEPTED_ADVISORY_URLS.size}):`);
+  for (const url of ACCEPTED_ADVISORY_URLS) {
+    console.log(`  - ${url}`);
+  }
+  console.log(`Findings reviewed: ${result.reviewed}`);
+  for (const line of result.details) {
+    console.log(`  ${line}`);
+  }
 
-console.log(`Production high/critical advisories: ${highs.length}`);
-for (const v of highs) {
-  const tag = ACCEPTED_HIGH.has(v.name) ? "accepted" : "UNEXPECTED";
-  const via = Array.isArray(v.via) && v.via[0] ? JSON.stringify(v.via[0]) : "n/a";
-  console.log(`  [${tag}] ${v.name} (${v.severity}) via ${via}`);
+  if (!result.ok) {
+    console.error("\nProduction audit failed:");
+    for (const error of result.errors) {
+      console.error(`  - ${error}`);
+    }
+    process.exit(1);
+  }
+
+  console.log("\nProduction audit passed (only documented accepted advisories).");
+  process.exit(0);
 }
 
-if (unexpected.length > 0) {
-  console.error("\nUnexpected production high/critical advisories. See docs/SECURITY_AUDIT.md.");
-  process.exit(1);
-}
-
-console.log("\nOnly documented accepted production highs remain (see docs/SECURITY_AUDIT.md).");
-process.exit(0);
+main();

@@ -4,7 +4,7 @@ import crypto from "crypto";
 import { prisma } from "@/lib/db";
 import { LIMITS } from "@/lib/config/limits";
 
-const ANONYMOUS_BUCKET = "anonymous:global";
+export const ANONYMOUS_BUCKET = "anonymous:global";
 
 function hashKey(kind: "email" | "ip", value: string): string {
   const digest = crypto.createHash("sha256").update(`${kind}:${value.toLowerCase()}`).digest("hex");
@@ -14,6 +14,11 @@ function hashKey(kind: "email" | "ip", value: string): string {
 function currentWindowStart(now = Date.now()): Date {
   const windowMs = LIMITS.loginWindowMs;
   return new Date(Math.floor(now / windowMs) * windowMs);
+}
+
+function retryAfterMs(): number {
+  const windowStart = currentWindowStart();
+  return Math.max(0, windowStart.getTime() + LIMITS.loginWindowMs - Date.now());
 }
 
 /**
@@ -58,10 +63,6 @@ async function resetBucket(bucketKey: string): Promise<void> {
   });
 }
 
-function aggregateFailureKey(ipAddress?: string | null): string {
-  return ipAddress ? hashKey("ip", ipAddress) : ANONYMOUS_BUCKET;
-}
-
 export async function cleanupLoginRateBuckets(): Promise<number> {
   const cutoff = new Date(Date.now() - LIMITS.loginAttemptRetentionMs);
   const result = await prisma.loginRateBucket.deleteMany({
@@ -73,17 +74,17 @@ export async function cleanupLoginRateBuckets(): Promise<number> {
   return result.count;
 }
 
-async function maybeCleanup(seed: string): Promise<void> {
-  if (parseInt(seed.slice(-2), 16) % 20 === 0) {
-    await cleanupLoginRateBuckets();
-  }
-}
-
 export type LoginRateOptions = {
   /** True only when the email matches an enabled account. */
   accountExists: boolean;
 };
 
+/**
+ * Rate-limit rules:
+ * - Trusted IP present: check account bucket (enabled accounts) + IP bucket (all requests).
+ * - No trusted IP: enabled accounts use only the account bucket; unknown accounts use anonymous:global.
+ * - Unknown-account anonymous traffic must never lock out enabled accounts.
+ */
 export async function checkLoginRateLimit(
   email: string,
   ipAddress?: string | null,
@@ -92,18 +93,28 @@ export async function checkLoginRateLimit(
   if (options.accountExists) {
     const emailFailures = await getBucketCount(hashKey("email", email));
     if (emailFailures >= LIMITS.loginMaxAttempts) {
-      const windowStart = currentWindowStart();
-      const retryAfterMs = Math.max(0, windowStart.getTime() + LIMITS.loginWindowMs - Date.now());
-      return { allowed: false, retryAfterMs };
+      return { allowed: false, retryAfterMs: retryAfterMs() };
     }
+    if (ipAddress) {
+      const ipFailures = await getBucketCount(hashKey("ip", ipAddress));
+      if (ipFailures >= LIMITS.loginMaxAttemptsPerIp) {
+        return { allowed: false, retryAfterMs: retryAfterMs() };
+      }
+    }
+    // Enabled accounts ignore anonymous:global
+    return { allowed: true };
   }
 
-  const aggregateKey = aggregateFailureKey(ipAddress);
-  const aggregateFailures = await getBucketCount(aggregateKey);
-  if (aggregateFailures >= LIMITS.loginMaxAttemptsPerIp) {
-    const windowStart = currentWindowStart();
-    const retryAfterMs = Math.max(0, windowStart.getTime() + LIMITS.loginWindowMs - Date.now());
-    return { allowed: false, retryAfterMs };
+  if (ipAddress) {
+    const ipFailures = await getBucketCount(hashKey("ip", ipAddress));
+    if (ipFailures >= LIMITS.loginMaxAttemptsPerIp) {
+      return { allowed: false, retryAfterMs: retryAfterMs() };
+    }
+  } else {
+    const anonFailures = await getBucketCount(ANONYMOUS_BUCKET);
+    if (anonFailures >= LIMITS.loginMaxAttemptsPerIp) {
+      return { allowed: false, retryAfterMs: retryAfterMs() };
+    }
   }
 
   return { allowed: true };
@@ -111,8 +122,9 @@ export async function checkLoginRateLimit(
 
 /**
  * Record login outcome.
- * Unknown/nonexistent emails do NOT create per-email buckets — failures aggregate
- * under the trusted IP bucket or a single global anonymous bucket.
+ * Success resets only the account bucket — never shared IP/global attack buckets.
+ * Unknown emails never create per-email buckets.
+ * Retention cleanup runs after every recorded attempt.
  */
 export async function recordLoginAttempt(
   email: string,
@@ -122,13 +134,11 @@ export async function recordLoginAttempt(
 ): Promise<void> {
   const normalizedEmail = email.toLowerCase();
   const emailKey = hashKey("email", normalizedEmail);
-  const aggregateKey = aggregateFailureKey(ipAddress);
 
   if (success) {
     if (options.accountExists) {
       await resetBucket(emailKey);
     }
-    await resetBucket(aggregateKey);
     await prisma.loginAttempt.create({
       data: {
         email: normalizedEmail,
@@ -138,7 +148,9 @@ export async function recordLoginAttempt(
     });
   } else if (options.accountExists) {
     await incrementBucket(emailKey);
-    await incrementBucket(aggregateKey);
+    if (ipAddress) {
+      await incrementBucket(hashKey("ip", ipAddress));
+    }
     await prisma.loginAttempt.create({
       data: {
         email: emailKey,
@@ -146,12 +158,13 @@ export async function recordLoginAttempt(
         ipAddress: ipAddress ? hashKey("ip", ipAddress) : null,
       },
     });
+  } else if (ipAddress) {
+    await incrementBucket(hashKey("ip", ipAddress));
   } else {
-    // Unknown account: only aggregate bucket — no per-email row growth
-    await incrementBucket(aggregateKey);
+    await incrementBucket(ANONYMOUS_BUCKET);
   }
 
-  await maybeCleanup(options.accountExists ? emailKey : aggregateKey);
+  await cleanupLoginRateBuckets();
 }
 
 export async function invalidateUserSessions(userId: string): Promise<void> {

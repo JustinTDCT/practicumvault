@@ -23,6 +23,7 @@ import {
 } from "@/lib/ai/format-evidence";
 import { TurnStructuredRecord } from "@/lib/ai/types";
 import { createPolicyViolationStreamResponse } from "@/lib/ai/cheat-detection";
+import { ModelCallLimitError } from "@/lib/ai/provider-calls";
 import {
   expireAttemptIfNeeded,
   getAttemptScenarioContent,
@@ -33,8 +34,16 @@ import {
 } from "@/lib/attempts/service";
 import { detectUnsafeActionDeterministic } from "@/lib/scoring/unsafe-actions";
 import { evaluateCurrentObjective, submitAttempt } from "@/lib/scoring/engine";
+import {
+  CANDIDATE_SCORING_FAILURE_MESSAGE,
+  PublicScoringError,
+} from "@/lib/scoring/public-error";
 import { LIMITS, POLICY_VIOLATION_PENALTY } from "@/lib/config/limits";
+import { logSafeError, safeErrorName } from "@/lib/security/safe-log";
 import { AttemptStatus, UserRole, Prisma } from "@prisma/client";
+
+const TURN_PROCESSING_FAILURE =
+  "The simulation could not process that action. Submit the specific action again.";
 
 type ChatAttempt = Prisma.AttemptGetPayload<{
   include: {
@@ -61,14 +70,27 @@ function checkRateLimit(timestamps: number[], windowMs: number, max: number): bo
   return recent.length < max;
 }
 
+function classifyTurnFailure(err: unknown): { category: string; retryable: boolean } {
+  if (err instanceof ModelCallLimitError) {
+    return { category: "model_call_limit", retryable: false };
+  }
+  if (err instanceof Error) {
+    const name = err.name || "Error";
+    if (/timeout/i.test(name) || /timeout/i.test(err.message)) {
+      return { category: "provider_timeout", retryable: true };
+    }
+  }
+  return { category: "provider_error", retryable: true };
+}
+
 async function persistTurnAssistant(
   attemptId: string,
   turnId: string,
   content: string,
   metadata?: Record<string, unknown>,
-): Promise<void> {
+): Promise<string> {
   const trimmed = content.trim();
-  if (!trimmed) return;
+  if (!trimmed) return "";
 
   try {
     await prisma.attemptMessage.create({
@@ -80,13 +102,70 @@ async function persistTurnAssistant(
         metadata: (metadata as object | undefined) ?? undefined,
       },
     });
+    return trimmed;
   } catch (err) {
-    // Unique (attemptId, turnId, role) — idempotent retry
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
-      return;
+      const existing = await prisma.attemptMessage.findFirst({
+        where: { attemptId, turnId, role: "assistant" },
+      });
+      return existing?.content ?? trimmed;
     }
     throw err;
   }
+}
+
+async function finishTurnAsProcessingFailure(options: {
+  attemptId: string;
+  turnId: string;
+  candidateMessageId: string;
+  err: unknown;
+  modelLabel?: string | null;
+}): Promise<Response> {
+  const { category, retryable } = classifyTurnFailure(options.err);
+  logSafeError("chat.turn_processing_failed", {
+    attemptId: options.attemptId,
+    category,
+    errorName: safeErrorName(options.err),
+    retryable,
+    correlationId: options.turnId,
+  });
+
+  const existingEvent = await prisma.attemptEvent.findFirst({
+    where: {
+      attemptId: options.attemptId,
+      type: "turn_processing_failed",
+      payload: { path: ["turnId"], equals: options.turnId },
+    },
+  });
+  if (!existingEvent) {
+    await prisma.attemptEvent.create({
+      data: {
+        attemptId: options.attemptId,
+        type: "turn_processing_failed",
+        payload: {
+          turnId: options.turnId,
+          candidateMessageId: options.candidateMessageId,
+          category,
+          retryable,
+          model: options.modelLabel ?? null,
+        },
+      },
+    });
+  }
+
+  const text = await persistTurnAssistant(
+    options.attemptId,
+    options.turnId,
+    TURN_PROCESSING_FAILURE,
+    {
+      type: "processing_failure",
+      category,
+      retryable,
+      turnId: options.turnId,
+    },
+  );
+
+  return createPolicyViolationStreamResponse(text || TURN_PROCESSING_FAILURE);
 }
 
 async function recordPolicyViolationIfNeeded(
@@ -180,9 +259,6 @@ export async function POST(
       await submitAttempt(attemptId);
       return Response.json({ completed: true });
     } catch (err) {
-      const { PublicScoringError, CANDIDATE_SCORING_FAILURE_MESSAGE } = await import(
-        "@/lib/scoring/public-error"
-      );
       if (err instanceof PublicScoringError) {
         return Response.json(
           {
@@ -193,7 +269,12 @@ export async function POST(
           { status: 200 },
         );
       }
-      console.error("[chat] submit failed", attemptId, err);
+      logSafeError("chat.submit_failed", {
+        attemptId,
+        category: "scoring_error",
+        errorName: safeErrorName(err),
+        retryable: true,
+      });
       return Response.json(
         { error: CANDIDATE_SCORING_FAILURE_MESSAGE },
         { status: 500 },
@@ -312,6 +393,18 @@ export async function POST(
       if (existingAssistant) {
         return createPolicyViolationStreamResponse(existingAssistant.content);
       }
+      const existingUser = await prisma.attemptMessage.findFirst({
+        where: { attemptId, turnId, role: "user" },
+      });
+      if (existingUser) {
+        return finishTurnAsProcessingFailure({
+          attemptId,
+          turnId,
+          candidateMessageId: existingUser.id,
+          err: new Error("orphan_user_turn"),
+          modelLabel: null,
+        });
+      }
       return Response.json({ error: "Turn already in progress" }, { status: 409 });
     }
     throw err;
@@ -322,154 +415,165 @@ export async function POST(
     data: { messageCount: { increment: 1 } },
   });
 
-  const { model, provider, modelName } = getLanguageModelForAttempt({
-    snapshot,
-    organization: attempt.organization,
-  });
-  const modelLabel = formatModelLabel(provider, modelName);
+  let modelLabel: string | null = null;
 
-  const existingUnsafe = parseUnsafeActionRecords(attempt.unsafeActionRecords);
-  const unsafeRecord = await detectUnsafeActionDeterministic(
-    content,
-    message.trim(),
-    existingUnsafe,
-    userMessage.id,
-    model,
-    attemptId,
-  );
-  if (unsafeRecord) {
-    await prisma.attempt.update({
-      where: { id: attemptId },
-      data: {
-        unsafeActionRecords: [...existingUnsafe, unsafeRecord] as object,
-        unsafeActions: [
-          ...(Array.isArray(attempt.unsafeActions) ? (attempt.unsafeActions as string[]) : []),
-          unsafeRecord.description,
-        ],
-      },
+  try {
+    const { model, provider, modelName } = getLanguageModelForAttempt({
+      snapshot,
+      organization: attempt.organization,
     });
-    await prisma.attemptEvent.create({
-      data: {
-        attemptId,
-        type: "unsafe_action",
-        payload: { ...unsafeRecord, turnId } as object,
-      },
-    });
-  }
+    modelLabel = formatModelLabel(provider, modelName);
 
-  const rawClassification = await classifyCandidateIntent(model, content, message.trim(), {
-    attemptId,
-  });
-  const validated = validateClassifiedAction(content, rawClassification, message.trim());
-  const classification = validated.classification;
-  const responseType = resolveResponseType({ ...classification, decision: validated.decision });
-
-  let evidenceIds: string[] = [];
-  let responseText: string | null = null;
-  let dialogueFallback = false;
-  let dialogueDeterministic = false;
-
-  if (validated.decision === "VALID_ACTION" && validated.approvedActionId) {
-    const matched = content.actions.find((a) => a.id === validated.approvedActionId)!;
-    const selected = selectEvidenceForAction(content, matched.id);
-    evidenceIds = selected.evidenceIds;
-
-    const revealed = [
-      ...new Set([...parseRevealedEvidenceIds(attempt.revealedEvidenceIds), ...evidenceIds]),
-    ];
-    await prisma.attempt.update({
-      where: { id: attemptId },
-      data: { revealedEvidenceIds: revealed },
-    });
-
-    const format = inferEvidenceFormat(matched.category, matched.label);
-    if (format === "dialogue") {
-      const dialogue = formatDeterministicDialogue(selected.evidence);
-      responseText = dialogue.text;
-      dialogueFallback = dialogue.usedFallback;
-      dialogueDeterministic = dialogue.deterministic;
-    } else {
-      responseText = formatDeterministicEvidence(
-        selected.evidence,
-        format,
-        classification.targetSystem,
-      );
-    }
-  } else if (validated.decision === "REFERENCE_QUESTION") {
-    responseText = await formatReferenceResponse(model, message.trim(), attemptId);
-  } else if (validated.clarification) {
-    responseText = validated.clarification;
-  } else if (validated.decision === "DELEGATION_REQUEST") {
-    responseText = DELEGATION_REFUSAL;
-  } else if (validated.decision === "ANSWER_SEEKING") {
-    responseText = ANSWER_SEEKING_REFUSAL;
-  } else if (validated.decision === "META_OR_PROMPT_ATTACK") {
-    responseText = PROMPT_ATTACK_REFUSAL;
-  } else {
-    responseText = buildStaticResponse({ ...classification, decision: validated.decision });
-  }
-
-  if (validated.validationFailed) {
-    await prisma.attemptEvent.create({
-      data: {
-        attemptId,
-        type: "action_validation_failed",
-        payload: {
-          turnId,
-          candidateMessageId: userMessage.id,
-          reason: validated.validationReason,
-          classifierDecision: rawClassification.decision,
-          matchedActionId: rawClassification.matchedActionId,
+    const existingUnsafe = parseUnsafeActionRecords(attempt.unsafeActionRecords);
+    const unsafeRecord = await detectUnsafeActionDeterministic(
+      content,
+      message.trim(),
+      existingUnsafe,
+      userMessage.id,
+      model,
+      attemptId,
+    );
+    if (unsafeRecord) {
+      await prisma.attempt.update({
+        where: { id: attemptId },
+        data: {
+          unsafeActionRecords: [...existingUnsafe, unsafeRecord] as object,
+          unsafeActions: [
+            ...(Array.isArray(attempt.unsafeActions) ? (attempt.unsafeActions as string[]) : []),
+            unsafeRecord.description,
+          ],
         },
-      },
+      });
+      await prisma.attemptEvent.create({
+        data: {
+          attemptId,
+          type: "unsafe_action",
+          payload: { ...unsafeRecord, turnId } as object,
+        },
+      });
+    }
+
+    const rawClassification = await classifyCandidateIntent(model, content, message.trim(), {
+      attemptId,
     });
-  }
+    const validated = validateClassifiedAction(content, rawClassification, message.trim());
+    const classification = validated.classification;
+    const responseType = resolveResponseType({ ...classification, decision: validated.decision });
 
-  if (!responseText) {
-    responseText = "That action is not available in this environment.";
-  }
+    let evidenceIds: string[] = [];
+    let responseText: string | null = null;
+    let dialogueFallback = false;
+    let dialogueDeterministic = false;
 
-  const turnRecord: TurnStructuredRecord = {
-    candidateMessageId: userMessage.id,
-    classificationDecision: validated.decision,
-    targetSystem: classification.targetSystem,
-    methodOrTool: classification.methodOrTool,
-    requestedAction: classification.requestedAction,
-    parameters: classification.parameters,
-    matchedActionId: validated.approvedActionId,
-    missingFields: classification.missingFields,
-    responseType,
-    evidenceIds,
-    classifierModel: modelLabel,
-    responderModel: modelLabel,
-  };
+    if (validated.decision === "VALID_ACTION" && validated.approvedActionId) {
+      const matched = content.actions.find((a) => a.id === validated.approvedActionId)!;
+      const selected = selectEvidenceForAction(content, matched.id);
+      evidenceIds = selected.evidenceIds;
 
-  await prisma.attempt.update({
-    where: { id: attemptId },
-    data: {
+      const revealed = [
+        ...new Set([...parseRevealedEvidenceIds(attempt.revealedEvidenceIds), ...evidenceIds]),
+      ];
+      await prisma.attempt.update({
+        where: { id: attemptId },
+        data: { revealedEvidenceIds: revealed },
+      });
+
+      const format = inferEvidenceFormat(matched.category, matched.label);
+      if (format === "dialogue") {
+        const dialogue = formatDeterministicDialogue(selected.evidence);
+        responseText = dialogue.text;
+        dialogueFallback = dialogue.usedFallback;
+        dialogueDeterministic = dialogue.deterministic;
+      } else {
+        responseText = formatDeterministicEvidence(
+          selected.evidence,
+          format,
+          classification.targetSystem,
+        );
+      }
+    } else if (validated.decision === "REFERENCE_QUESTION") {
+      responseText = await formatReferenceResponse(model, message.trim(), attemptId);
+    } else if (validated.clarification) {
+      responseText = validated.clarification;
+    } else if (validated.decision === "DELEGATION_REQUEST") {
+      responseText = DELEGATION_REFUSAL;
+    } else if (validated.decision === "ANSWER_SEEKING") {
+      responseText = ANSWER_SEEKING_REFUSAL;
+    } else if (validated.decision === "META_OR_PROMPT_ATTACK") {
+      responseText = PROMPT_ATTACK_REFUSAL;
+    } else {
+      responseText = buildStaticResponse({ ...classification, decision: validated.decision });
+    }
+
+    if (validated.validationFailed) {
+      await prisma.attemptEvent.create({
+        data: {
+          attemptId,
+          type: "action_validation_failed",
+          payload: {
+            turnId,
+            candidateMessageId: userMessage.id,
+            reason: validated.validationReason,
+            classifierDecision: rawClassification.decision,
+            matchedActionId: rawClassification.matchedActionId,
+          },
+        },
+      });
+    }
+
+    if (!responseText) {
+      responseText = "That action is not available in this environment.";
+    }
+
+    const turnRecord: TurnStructuredRecord = {
+      candidateMessageId: userMessage.id,
+      classificationDecision: validated.decision,
+      targetSystem: classification.targetSystem,
+      methodOrTool: classification.methodOrTool,
+      requestedAction: classification.requestedAction,
+      parameters: classification.parameters,
+      matchedActionId: validated.approvedActionId,
+      missingFields: classification.missingFields,
+      responseType,
+      evidenceIds,
       classifierModel: modelLabel,
       responderModel: modelLabel,
-    },
-  });
+    };
 
-  await prisma.attemptEvent.create({
-    data: {
+    await prisma.attempt.update({
+      where: { id: attemptId },
+      data: {
+        classifierModel: modelLabel,
+        responderModel: modelLabel,
+      },
+    });
+
+    await prisma.attemptEvent.create({
+      data: {
+        attemptId,
+        type: "turn_classified",
+        payload: { ...turnRecord, turnId, dialogueFallback, dialogueDeterministic } as object,
+      },
+    });
+
+    await recordPolicyViolationIfNeeded(attemptId, turnId, userMessage.id, validated.decision);
+
+    const persisted = await persistTurnAssistant(attemptId, turnId, responseText, {
+      responseType,
+      classificationDecision: validated.decision,
+      dialogueFallback,
+      dialogueDeterministic,
+      turnId,
+    });
+
+    return createPolicyViolationStreamResponse(persisted);
+  } catch (err) {
+    return finishTurnAsProcessingFailure({
       attemptId,
-      type: "turn_classified",
-      payload: { ...turnRecord, turnId, dialogueFallback, dialogueDeterministic } as object,
-    },
-  });
-
-  await recordPolicyViolationIfNeeded(attemptId, turnId, userMessage.id, validated.decision);
-
-  await persistTurnAssistant(attemptId, turnId, responseText, {
-    responseType,
-    classificationDecision: validated.decision,
-    dialogueFallback,
-    dialogueDeterministic,
-    turnId,
-  });
-
-  // Return exactly the persisted validated text — never stream unvalidated dialogue
-  return createPolicyViolationStreamResponse(responseText);
+      turnId,
+      candidateMessageId: userMessage.id,
+      err,
+      modelLabel,
+    });
+  }
 }

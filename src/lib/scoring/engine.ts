@@ -28,6 +28,7 @@ import {
   PublicScoringError,
   toPublicScoringError,
 } from "@/lib/scoring/public-error";
+import { logSafeError, safeErrorName } from "@/lib/security/safe-log";
 import { ScenarioTemplateContent } from "@/lib/templates/schema";
 
 const objectiveEvalSchema = z.object({
@@ -595,8 +596,12 @@ export async function scoreAttempt(
         },
       },
     });
-    // Keep detailed exception server-side only
-    console.error("[scoring] attempt failed", attemptId, err);
+    logSafeError("scoring.attempt_failed", {
+      attemptId,
+      category: "scoring_error",
+      errorName: safeErrorName(err),
+      retryable: true,
+    });
     throw toPublicScoringError(err);
   }
 }

@@ -103,8 +103,17 @@ export async function PATCH(request: NextRequest) {
         },
       });
     } catch (err) {
-      const { publicScoringErrorBody } = await import("@/lib/scoring/public-error");
-      console.error("[admin] rescore failed", attemptId, err);
+      const { publicScoringErrorBody, toPublicScoringError } = await import(
+        "@/lib/scoring/public-error"
+      );
+      const { logSafeError, safeErrorName } = await import("@/lib/security/safe-log");
+      const publicErr = toPublicScoringError(err);
+      logSafeError("admin.rescore_failed", {
+        attemptId,
+        category: publicErr.category,
+        errorName: safeErrorName(err),
+        retryable: publicErr.retryable,
+      });
       return NextResponse.json(publicScoringErrorBody(err), { status: 400 });
     }
   }

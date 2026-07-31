@@ -24,6 +24,9 @@ import { PublicScoringError, CANDIDATE_SCORING_FAILURE_MESSAGE } from "../../src
 import { PATCH as adminAttemptsPATCH } from "../../src/app/api/admin/attempts/route";
 import { POST as chatPOST } from "../../src/app/api/attempts/[id]/chat/route";
 
+const SECRET_KEY = "sk-test-LEAKEDKEY1234567890";
+const SECRET_ENDPOINT = "https://api.openai.com/v1/responses";
+
 describe("scoring error sanitization at route boundaries (integration)", () => {
   beforeAll(() => {
     requireTestDatabase();
@@ -40,14 +43,13 @@ describe("scoring error sanitization at route boundaries (integration)", () => {
     await prisma.$disconnect();
   });
 
-  it("admin rescore response never includes provider secrets", async () => {
+  it("admin rescore response and logs never include provider secrets", async () => {
     const seeded = await seedOrg("OrgA");
     vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.admin));
     vi.mocked(rescoreAttempt).mockRejectedValue(
-      new Error(
-        "Provider failed at https://api.openai.com/v1/responses using sk-test-LEAKEDKEY1234567890",
-      ),
+      new Error(`Provider failed at ${SECRET_ENDPOINT} using ${SECRET_KEY}`),
     );
+    const spy = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     const res = await adminAttemptsPATCH(
       new NextRequest("http://localhost/api/admin/attempts", {
@@ -63,13 +65,19 @@ describe("scoring error sanitization at route boundaries (integration)", () => {
     expect(res.status).toBe(400);
     const body = await res.json();
     const serialized = JSON.stringify(body);
-    expect(serialized).not.toContain("sk-test-");
-    expect(serialized).not.toContain("api.openai.com");
+    expect(serialized).not.toContain(SECRET_KEY);
+    expect(serialized).not.toContain(SECRET_ENDPOINT);
     expect(body.category).toBe("scoring_error");
     expect(body.retryable).toBe(true);
+
+    const logged = spy.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
+    expect(logged).not.toContain(SECRET_KEY);
+    expect(logged).not.toContain(SECRET_ENDPOINT);
+    expect(logged).toContain("admin.rescore_failed");
+    spy.mockRestore();
   });
 
-  it("candidate complete returns generic scoring failure without secrets", async () => {
+  it("candidate complete returns generic scoring failure without secrets in response or logs", async () => {
     const seeded = await seedOrg("OrgA");
     const snapshot = buildScenarioSnapshot(seeded.template, seeded.version, seeded.org);
     const attempt = await prisma.attempt.create({
@@ -90,9 +98,10 @@ describe("scoring error sanitization at route boundaries (integration)", () => {
         publicMessage: CANDIDATE_SCORING_FAILURE_MESSAGE,
         category: "scoring_error",
         retryable: true,
-        cause: new Error("sk-test-SECRET https://api.openai.com/v1/chat"),
+        cause: new Error(`${SECRET_KEY} ${SECRET_ENDPOINT}`),
       }),
     );
+    const spy = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     const res = await chatPOST(
       new NextRequest(`http://localhost/api/attempts/${attempt.id}/chat`, {
@@ -107,7 +116,12 @@ describe("scoring error sanitization at route boundaries (integration)", () => {
     const body = await res.json();
     const serialized = JSON.stringify(body);
     expect(body.error).toBe(CANDIDATE_SCORING_FAILURE_MESSAGE);
-    expect(serialized).not.toContain("sk-test-");
-    expect(serialized).not.toContain("api.openai.com");
+    expect(serialized).not.toContain(SECRET_KEY);
+    expect(serialized).not.toContain(SECRET_ENDPOINT);
+
+    const logged = spy.mock.calls.map((c) => c.map(String).join(" ")).join("\n");
+    expect(logged).not.toContain(SECRET_KEY);
+    expect(logged).not.toContain(SECRET_ENDPOINT);
+    spy.mockRestore();
   });
 });
