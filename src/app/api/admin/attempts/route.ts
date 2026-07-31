@@ -2,23 +2,22 @@ import { NextRequest, NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
 import { prisma } from "@/lib/db";
 import { rescoreAttempt } from "@/lib/scoring/engine";
-import { parseScenarioSnapshot } from "@/lib/attempts/snapshot";
+import { SnapshotIntegrityError, requireAttemptSnapshot } from "@/lib/attempts/snapshot";
 import { RescoreModelMode } from "@/lib/ai/provider";
 import { UserRole } from "@prisma/client";
 
-function titleFromAttempt(a: {
-  scenarioSnapshot: unknown;
-  scenarioVersion: { version: string; template: { title: string } };
-}) {
-  if (a.scenarioSnapshot) {
-    try {
-      const snap = parseScenarioSnapshot(a.scenarioSnapshot);
-      return { title: snap.templateTitle, version: snap.versionDisplay };
-    } catch {
-      // fall through
-    }
+function titleFromAttempt(a: { scenarioSnapshot: unknown }) {
+  const snap = requireAttemptSnapshot(a);
+  if (!snap.templateSlug) {
+    throw new SnapshotIntegrityError(
+      "Historical scenario snapshot is missing templateSlug. Run snapshot backfill.",
+    );
   }
-  return { title: a.scenarioVersion.template.title, version: a.scenarioVersion.version };
+  return {
+    title: snap.templateTitle,
+    version: snap.versionDisplay,
+    slug: snap.templateSlug,
+  };
 }
 
 export async function GET() {
@@ -40,19 +39,41 @@ export async function GET() {
 
   return NextResponse.json({
     attempts: attempts.map((a) => {
-      const meta = titleFromAttempt(a);
-      return {
-        id: a.id,
-        candidateName: a.candidate.fullName,
-        scenarioTitle: meta.title,
-        version: meta.version,
-        status: a.status,
-        overallScore: a.overallScore,
-        startedAt: a.startedAt,
-        completedAt: a.completedAt,
-        submittedAt: a.submittedAt,
-        scoringAttempts: a.scoringAttempts,
-      };
+      try {
+        const meta = titleFromAttempt(a);
+        return {
+          id: a.id,
+          candidateName: a.candidate.fullName,
+          scenarioTitle: meta.title,
+          scenarioSlug: meta.slug,
+          version: meta.version,
+          status: a.status,
+          overallScore: a.overallScore,
+          startedAt: a.startedAt,
+          completedAt: a.completedAt,
+          submittedAt: a.submittedAt,
+          scoringAttempts: a.scoringAttempts,
+          snapshotIntegrityError: null as string | null,
+        };
+      } catch (err) {
+        return {
+          id: a.id,
+          candidateName: a.candidate.fullName,
+          scenarioTitle: "(snapshot integrity error)",
+          scenarioSlug: null,
+          version: null,
+          status: a.status,
+          overallScore: a.overallScore,
+          startedAt: a.startedAt,
+          completedAt: a.completedAt,
+          submittedAt: a.submittedAt,
+          scoringAttempts: a.scoringAttempts,
+          snapshotIntegrityError:
+            err instanceof SnapshotIntegrityError
+              ? err.message
+              : "Historical scenario snapshot is missing or invalid. Run snapshot backfill.",
+        };
+      }
     }),
   });
 }

@@ -5,6 +5,7 @@ import {
   buildTranscriptFilename,
   formatAttemptTranscript,
 } from "@/lib/transcript/format-transcript";
+import { SnapshotIntegrityError } from "@/lib/attempts/snapshot";
 import { UserRole } from "@prisma/client";
 
 export async function GET(
@@ -27,13 +28,24 @@ export async function GET(
 
   if (!attempt) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-  const body = formatAttemptTranscript(attempt);
-  const filename = buildTranscriptFilename(attempt);
-
-  return new NextResponse(body, {
-    headers: {
-      "Content-Type": "text/plain; charset=utf-8",
-      "Content-Disposition": `attachment; filename="${filename}"`,
-    },
-  });
+  try {
+    const body = formatAttemptTranscript(attempt);
+    const filename = buildTranscriptFilename(attempt);
+    return new NextResponse(body, {
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Content-Disposition": `attachment; filename="${filename}"`,
+      },
+    });
+  } catch (err) {
+    return NextResponse.json(
+      {
+        error:
+          err instanceof SnapshotIntegrityError
+            ? err.message
+            : "Historical scenario snapshot is missing or invalid. Run snapshot backfill.",
+      },
+      { status: 409 },
+    );
+  }
 }

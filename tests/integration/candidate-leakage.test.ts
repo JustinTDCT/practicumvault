@@ -1,161 +1,303 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { prisma, requireTestDatabase, resetTestDatabase, seedOrg } from "./helpers";
-import { buildScenarioSnapshot } from "../../src/lib/attempts/snapshot";
-import { AttemptStatus } from "@prisma/client";
+import { NextRequest } from "next/server";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { UserRole } from "@prisma/client";
+import { prisma, requireTestDatabase, resetTestDatabase, seedOrg, asSession, SECRETS_FOR } from "./helpers";
 import { assertNoCandidateLeakage } from "../../src/lib/dto/candidate";
+import { ScenarioTemplateContent } from "../../src/lib/templates/schema";
+import { IntentClassification } from "../../src/lib/ai/types";
 
-const SECRETS = [
-  "SECRET_ROOT_CAUSE_OrgA",
-  "SECRET_HIDDEN_FACT_OrgA",
-  "SECRET_ACTION_RESULT_OrgA",
-  "SECRET_OBJECTIVE_NAME_OrgA",
-  "SECRET_PASS_CRITERIA_OrgA",
-  "SECRET_RUBRIC_CATEGORY_OrgA",
-  "SECRET_HINT_TEXT_OrgA",
-  "SECRET_AI_INSTRUCTIONS_OrgA",
-];
+vi.mock("@/lib/auth", () => ({
+  requireAuth: vi.fn(),
+  getSession: vi.fn(),
+}));
 
-describe("candidate data leakage (integration)", () => {
+vi.mock("@/lib/ai/provider", () => ({
+  getLanguageModelForAttempt: vi.fn(() => ({
+    model: { modelId: "test-model" },
+    provider: "LOCAL",
+    modelName: "test-model",
+    mode: "ORIGINAL_MODEL",
+  })),
+  formatModelLabel: vi.fn(() => "Local (OpenAI-compatible)/test-model"),
+}));
+
+vi.mock("@/lib/ai/classifier", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/ai/classifier")>();
+  return {
+    ...actual,
+    classifyCandidateIntent: vi.fn(),
+  };
+});
+
+vi.mock("@/lib/ai/format-evidence", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/ai/format-evidence")>();
+  return {
+    ...actual,
+    generateValidatedDialogue: vi.fn(),
+  };
+});
+
+vi.mock("@/lib/scoring/engine", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/scoring/engine")>();
+  return {
+    ...actual,
+    evaluateCurrentObjective: vi.fn(),
+  };
+});
+
+import { requireAuth } from "@/lib/auth";
+import { classifyCandidateIntent } from "@/lib/ai/classifier";
+import { generateValidatedDialogue } from "@/lib/ai/format-evidence";
+import { evaluateCurrentObjective } from "@/lib/scoring/engine";
+import { GET as dashboardGET } from "../../src/app/api/candidate/dashboard/route";
+import { POST as startPOST } from "../../src/app/api/attempts/start/route";
+import { GET as attemptGET } from "../../src/app/api/attempts/[id]/route";
+import { POST as chatPOST } from "../../src/app/api/attempts/[id]/chat/route";
+
+function jsonRequest(url: string, body: unknown): NextRequest {
+  return new NextRequest(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+async function startAttempt(assignmentId: string): Promise<string> {
+  const res = await startPOST(jsonRequest("http://localhost/api/attempts/start", { assignmentId }));
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  return body.attempt.id;
+}
+
+function streamText(body: string): string {
+  return body
+    .split("\n")
+    .filter((line) => line.startsWith("0:"))
+    .map((line) => JSON.parse(line.slice(2)) as string)
+    .join("");
+}
+
+async function chat(attemptId: string, body: unknown): Promise<Response> {
+  return chatPOST(jsonRequest(`http://localhost/api/attempts/${attemptId}/chat`, body), {
+    params: Promise.resolve({ id: attemptId }),
+  });
+}
+
+function validHostsClassification(overrides: Partial<IntentClassification> = {}): IntentClassification {
+  return {
+    decision: "VALID_ACTION",
+    matchedActionId: "hosts-view",
+    targetSystem: "CLIENT-PC",
+    methodOrTool: "type",
+    requestedAction: "view hosts",
+    parameters: {},
+    missingFields: [],
+    reasoning: "valid action",
+    ...overrides,
+  };
+}
+
+function assertNoSecrets(value: unknown, secrets = SECRETS_FOR("OrgA")) {
+  const serialized = typeof value === "string" ? value : JSON.stringify(value);
+  expect(() => assertNoCandidateLeakage(serialized, secrets)).not.toThrow();
+  for (const secret of secrets) {
+    expect(serialized).not.toContain(secret);
+  }
+}
+
+describe("candidate data leakage route coverage (integration)", () => {
   beforeAll(() => {
     requireTestDatabase();
   });
 
   beforeEach(async () => {
     await resetTestDatabase();
+    vi.mocked(requireAuth).mockReset();
+    vi.mocked(classifyCandidateIntent).mockReset();
+    vi.mocked(generateValidatedDialogue).mockReset();
+    vi.mocked(evaluateCurrentObjective).mockReset();
+    vi.mocked(evaluateCurrentObjective).mockResolvedValue([]);
   });
 
   afterAll(async () => {
     await prisma.$disconnect();
   });
 
-  it("dashboard select shape does not load scenario content", async () => {
+  it("candidate dashboard response excludes scenario content and snapshot secrets", async () => {
     const seeded = await seedOrg("OrgA");
-    const rows = await prisma.assignment.findMany({
-      where: { candidateId: seeded.candidate.id },
-      select: {
-        id: true,
-        status: true,
-        scenarioVersion: {
-          select: {
-            version: true,
-            timeLimitMinutes: true,
-            template: { select: { title: true } },
-          },
-        },
-      },
-    });
+    vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.candidate));
 
-    const response = {
-      assignments: rows.map((a) => ({
-        id: a.id,
-        status: a.status,
-        canStart: true,
-        scenario: {
-          title: a.scenarioVersion.template.title,
-          displayedVersion: a.scenarioVersion.version,
-          timeLimitMinutes: a.scenarioVersion.timeLimitMinutes,
-        },
-      })),
-    };
-
-    const serialized = JSON.stringify(response);
-    expect(() => assertNoCandidateLeakage(serialized, SECRETS)).not.toThrow();
-    for (const secret of SECRETS) {
-      expect(serialized).not.toContain(secret);
-    }
+    const res = await dashboardGET();
+    expect(res.status).toBe(200);
+    assertNoSecrets(await res.json());
   });
 
-  it("start response DTO excludes snapshot and secrets", async () => {
+  it("start response excludes snapshot and seeded secrets", async () => {
     const seeded = await seedOrg("OrgA");
-    const snapshot = buildScenarioSnapshot(seeded.template, seeded.version, seeded.org);
-    const attempt = await prisma.attempt.create({
-      data: {
-        assignmentId: seeded.assignment.id,
-        candidateId: seeded.candidate.id,
-        scenarioVersionId: seeded.version.id,
-        organizationId: seeded.org.id,
-        expiresAt: new Date(Date.now() + 45 * 60_000),
-        scenarioSnapshot: snapshot as object,
-        status: AttemptStatus.IN_PROGRESS,
-      },
-      select: { id: true, status: true, startedAt: true, expiresAt: true },
-    });
+    vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.candidate));
 
-    const response = {
-      attempt: {
-        id: attempt.id,
-        status: "IN_PROGRESS" as const,
-        startedAt: attempt.startedAt.toISOString(),
-        expiresAt: attempt.expiresAt.toISOString(),
-      },
-    };
-
-    const serialized = JSON.stringify(response);
-    expect(() => assertNoCandidateLeakage(serialized, SECRETS)).not.toThrow();
-    expect(serialized).not.toContain("scenarioSnapshot");
-    expect(serialized).not.toContain(snapshot.content.environment.rootCause);
+    const res = await startPOST(jsonRequest("http://localhost/api/attempts/start", {
+      assignmentId: seeded.assignment.id,
+    }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(JSON.stringify(body)).not.toContain("scenarioSnapshot");
+    assertNoSecrets(body);
   });
 
-  it("concurrent starts create only one attempt", async () => {
+  it("candidate attempt GET returns only candidate-visible attempt data", async () => {
     const seeded = await seedOrg("OrgA");
-    const snapshot = buildScenarioSnapshot(seeded.template, seeded.version, seeded.org);
+    vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.candidate));
+    const attemptId = await startAttempt(seeded.assignment.id);
 
-    const startOnce = async () => {
-      return prisma.$transaction(async (tx) => {
-        const claimed = await tx.assignment.updateMany({
-          where: {
-            id: seeded.assignment.id,
-            status: "PENDING",
-          },
-          data: { status: "IN_PROGRESS" },
-        });
-        if (claimed.count !== 1) {
-          throw new Error("ASSIGNMENT_NOT_STARTABLE");
-        }
-        return tx.attempt.create({
-          data: {
-            assignmentId: seeded.assignment.id,
-            candidateId: seeded.candidate.id,
-            scenarioVersionId: seeded.version.id,
-            organizationId: seeded.org.id,
-            expiresAt: new Date(Date.now() + 45 * 60_000),
-            scenarioSnapshot: snapshot as object,
-            status: AttemptStatus.IN_PROGRESS,
-          },
-        });
-      });
-    };
-
-    const results = await Promise.allSettled([startOnce(), startOnce()]);
-    const fulfilled = results.filter((r) => r.status === "fulfilled");
-    expect(fulfilled.length).toBe(1);
-
-    const attempts = await prisma.attempt.count({
-      where: { candidateId: seeded.candidate.id, status: AttemptStatus.IN_PROGRESS },
+    const res = await attemptGET(new NextRequest(`http://localhost/api/attempts/${attemptId}`), {
+      params: Promise.resolve({ id: attemptId }),
     });
-    expect(attempts).toBe(1);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(JSON.stringify(body)).not.toContain("scenarioSnapshot");
+    assertNoSecrets(body);
   });
 
-  it("rejects cross-organization attempt access", async () => {
+  it("objective check response does not expose objective or scoring secrets", async () => {
+    const seeded = await seedOrg("OrgA");
+    vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.candidate));
+    const attemptId = await startAttempt(seeded.assignment.id);
+
+    const res = await chat(attemptId, { action: "evaluate_objective" });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({ evaluated: true });
+    assertNoSecrets(body);
+  });
+
+  it("static clarification path does not echo classifier reasoning or hidden facts", async () => {
+    const seeded = await seedOrg("OrgA");
+    vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.candidate));
+    vi.mocked(classifyCandidateIntent).mockResolvedValue({
+      decision: "INCOMPLETE_ACTION",
+      matchedActionId: "hosts-view",
+      targetSystem: null,
+      methodOrTool: null,
+      requestedAction: "check hosts",
+      parameters: {},
+      missingFields: ["targetSystem"],
+      reasoning: "SECRET_ROOT_CAUSE_OrgA SECRET_AI_INSTRUCTIONS_OrgA",
+    });
+    const attemptId = await startAttempt(seeded.assignment.id);
+
+    const res = await chat(attemptId, {
+      message: "Check hosts",
+      turnId: "clarify-turn-0001",
+    });
+    expect(res.status).toBe(200);
+    const text = streamText(await res.text());
+    expect(text).toContain("Which system");
+    assertNoSecrets(text);
+  });
+
+  it("deterministic evidence reveals only the approved action result", async () => {
+    const seeded = await seedOrg("OrgA");
+    vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.candidate));
+    vi.mocked(classifyCandidateIntent).mockResolvedValue(validHostsClassification());
+    const attemptId = await startAttempt(seeded.assignment.id);
+
+    const res = await chat(attemptId, {
+      message: "On CLIENT-PC, type the hosts file",
+      turnId: "hosts-turn-0001",
+    });
+    expect(res.status).toBe(200);
+    const text = streamText(await res.text());
+    expect(text).toContain("SECRET_ACTION_RESULT_OrgA");
+    assertNoSecrets(text);
+  });
+
+  it("dialogue fallback returns approved facts and never malicious generated coaching", async () => {
+    const seeded = await seedOrg("OrgA");
+    const content = seeded.content as ScenarioTemplateContent;
+    content.actions.push({
+      id: "call-user",
+      label: "Call user",
+      triggers: ["call user"],
+      result: "APPROVED_DIALOGUE_FACT_OrgA: Selina says only her PC is affected.",
+      category: "communication",
+      requirements: {
+        requireTargetSystem: true,
+        requireMethodOrTool: true,
+        requiredParameters: [],
+        allowedTargets: ["Selina"],
+        allowedMethods: ["call"],
+        requirementsReviewed: true,
+        intentionallyUnrestricted: false,
+      },
+    });
+    await prisma.scenarioVersion.update({
+      where: { id: seeded.version.id },
+      data: { content },
+    });
+
+    vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.candidate));
+    vi.mocked(classifyCandidateIntent).mockResolvedValue(validHostsClassification({
+      matchedActionId: "call-user",
+      targetSystem: "Selina",
+      methodOrTool: "call",
+      requestedAction: "call user",
+    }));
+    vi.mocked(generateValidatedDialogue).mockResolvedValue({
+      text: "APPROVED_DIALOGUE_FACT_OrgA: Selina says only her PC is affected.",
+      usedFallback: true,
+      reason: "prohibited_content",
+    });
+    const attemptId = await startAttempt(seeded.assignment.id);
+
+    const res = await chat(attemptId, {
+      message: "Call Selina",
+      turnId: "dialogue-turn-0001",
+    });
+    expect(res.status).toBe(200);
+    const text = streamText(await res.text());
+    expect(text).toContain("APPROVED_DIALOGUE_FACT_OrgA");
+    expect(text).not.toContain("MALICIOUS_ROOT_CAUSE_COACHING");
+    assertNoSecrets(text);
+  });
+
+  it("returns 404 for candidate GET and chat against another organization's attempt", async () => {
     const orgA = await seedOrg("OrgA");
     const orgB = await seedOrg("OrgB");
-    const snapshot = buildScenarioSnapshot(orgA.template, orgA.version, orgA.org);
-    const attempt = await prisma.attempt.create({
-      data: {
-        assignmentId: orgA.assignment.id,
-        candidateId: orgA.candidate.id,
-        scenarioVersionId: orgA.version.id,
-        organizationId: orgA.org.id,
-        expiresAt: new Date(Date.now() + 45 * 60_000),
-        scenarioSnapshot: snapshot as object,
-        status: AttemptStatus.COMPLETED,
-        submittedAt: new Date(),
-      },
-    });
+    vi.mocked(requireAuth).mockResolvedValue(asSession(orgA.candidate));
+    const attemptId = await startAttempt(orgA.assignment.id);
 
-    const cross = await prisma.attempt.findFirst({
-      where: { id: attempt.id, organizationId: orgB.org.id },
+    vi.mocked(requireAuth).mockResolvedValue(asSession(orgB.candidate));
+    const getRes = await attemptGET(new NextRequest(`http://localhost/api/attempts/${attemptId}`), {
+      params: Promise.resolve({ id: attemptId }),
     });
-    expect(cross).toBeNull();
+    expect(getRes.status).toBe(404);
+
+    const chatRes = await chat(attemptId, {
+      message: "On CLIENT-PC, type the hosts file",
+      turnId: "cross-org-turn-01",
+    });
+    expect(chatRes.status).toBe(404);
+    expect(await chatRes.text()).toBe("Not found");
+  });
+
+  it("allows admins to see attempt metadata without candidate-only hidden scenario content", async () => {
+    const seeded = await seedOrg("OrgA");
+    vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.candidate));
+    const attemptId = await startAttempt(seeded.assignment.id);
+
+    vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.admin));
+    const res = await attemptGET(new NextRequest(`http://localhost/api/attempts/${attemptId}`), {
+      params: Promise.resolve({ id: attemptId }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.attempt.scenarioTitle).toBe("OrgA Scenario");
+    expect(body.attempt.candidateName).toBe(`${"OrgA"} Candidate`);
+    const serialized = JSON.stringify(body);
+    for (const secret of SECRETS_FOR("OrgA")) {
+      expect(serialized).not.toContain(secret);
+    }
+    expect(asSession(seeded.admin).role).toBe(UserRole.ADMIN);
   });
 });

@@ -2,11 +2,16 @@
 
 import { AdminNav } from "@/components/admin-nav";
 import { StringListEditor } from "@/components/string-list-editor";
-import { ScenarioTemplateContent, validateTemplateContent } from "@/lib/templates/schema";
+import {
+  ScenarioTemplateContent,
+  canPublishTemplateContent,
+  getDefaultActionRequirements,
+  validateTemplateContent,
+} from "@/lib/templates/schema";
 import { getNextObjectiveId, reindexObjectives } from "@/lib/templates/objectives";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 export default function TemplateEditorPage() {
   const params = useParams();
@@ -83,6 +88,11 @@ export default function TemplateEditorPage() {
     setMessage(data.warning ? `Saved. ${data.warning}` : "Saved");
   }
 
+  const specificity = useMemo(
+    () => (content ? canPublishTemplateContent(content) : { ok: true, issues: [] as string[] }),
+    [content],
+  );
+
   if (!content) {
     return (<><AdminNav /><div className="container">Loading...</div></>);
   }
@@ -111,6 +121,22 @@ export default function TemplateEditorPage() {
             )}
           </p>
         </div>
+
+        {!specificity.ok && (
+          <div className="alert" style={{ marginBottom: 16, borderColor: "var(--warning)" }}>
+            <strong>Action specificity review required.</strong>
+            <p style={{ margin: "8px 0 0", color: "var(--text-muted)" }}>
+              {status === "PUBLISHED"
+                ? "This published scenario can still be edited, but new assignments are blocked until every action’s specificity requirements are reviewed."
+                : "Publishing is blocked until every action’s specificity requirements are reviewed."}
+            </p>
+            <ul style={{ margin: "8px 0 0", paddingLeft: 18 }}>
+              {specificity.issues.map((issue) => (
+                <li key={issue}>{issue}</li>
+              ))}
+            </ul>
+          </div>
+        )}
 
         {message && <p className={message.startsWith("Saved") || message.includes("Published") ? "success" : "error"}>{message}</p>}
 
@@ -325,9 +351,20 @@ export default function TemplateEditorPage() {
         <div className="card" style={{ marginBottom: 16 }}>
           <h3>Actions</h3>
           <p style={{ color: "var(--text-muted)", fontSize: 14 }}>
-            Predefined diagnostic actions and their results. The AI maps candidate requests to these.
+            Predefined diagnostic actions and their results. For each action, set specificity rules so
+            candidates must name a real system, tool, or contact before evidence is revealed.
           </p>
-          {content.actions.map((action, i) => (
+          {content.actions.map((action, i) => {
+            const req = action.requirements ?? getDefaultActionRequirements();
+            const updateRequirements = (patch: Partial<typeof req>) => {
+              const actions = [...content.actions];
+              actions[i] = {
+                ...action,
+                requirements: { ...req, ...patch },
+              };
+              setContent({ ...content, actions });
+            };
+            return (
             <div key={`${action.id}-${i}`} style={{ marginBottom: 12, padding: 12, background: "var(--surface-2)", borderRadius: 8 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
                 <span style={{ color: "var(--text-muted)", fontSize: 13 }}>Action {i + 1}</span>
@@ -369,6 +406,27 @@ export default function TemplateEditorPage() {
                   disabled={status === "DISABLED"}
                 />
               </div>
+              <label style={{ display: "block", marginTop: 8, fontSize: 13 }}>
+                Category
+                <select
+                  value={action.category}
+                  onChange={(e) => {
+                    const actions = [...content.actions];
+                    actions[i] = {
+                      ...action,
+                      category: e.target.value as typeof action.category,
+                    };
+                    setContent({ ...content, actions });
+                  }}
+                  disabled={status === "DISABLED"}
+                  style={{ display: "block", width: "100%", marginTop: 4 }}
+                >
+                  <option value="diagnostic">Diagnostic</option>
+                  <option value="communication">Communication</option>
+                  <option value="remediation">Remediation</option>
+                  <option value="validation">Validation</option>
+                </select>
+              </label>
               <textarea
                 placeholder="Predefined result"
                 value={action.result}
@@ -380,8 +438,149 @@ export default function TemplateEditorPage() {
                 disabled={status === "DISABLED"}
                 style={{ marginTop: 8 }}
               />
+
+              <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--border)" }}>
+                <h4 style={{ margin: "0 0 8px", fontSize: 14 }}>Specificity requirements</h4>
+                <p style={{ margin: "0 0 10px", color: "var(--text-muted)", fontSize: 13 }}>
+                  These rules decide when the simulation may reveal this action’s result. Leave a box
+                  unchecked only when that detail is not needed, then mark the action reviewed.
+                </p>
+                <label style={{ display: "flex", gap: 8, alignItems: "flex-start", marginBottom: 8, fontSize: 14 }}>
+                  <input
+                    type="checkbox"
+                    checked={req.requireTargetSystem}
+                    disabled={status === "DISABLED" || req.intentionallyUnrestricted}
+                    onChange={(e) => updateRequirements({ requireTargetSystem: e.target.checked })}
+                  />
+                  <span>
+                    <strong>Require target system</strong>
+                    <br />
+                    <span style={{ color: "var(--text-muted)", fontSize: 13 }}>
+                      Candidate must name which computer, server, or account they are checking
+                      (for example CLIENT-PC).
+                    </span>
+                  </span>
+                </label>
+                <label style={{ display: "flex", gap: 8, alignItems: "flex-start", marginBottom: 8, fontSize: 14 }}>
+                  <input
+                    type="checkbox"
+                    checked={req.requireMethodOrTool}
+                    disabled={status === "DISABLED" || req.intentionallyUnrestricted}
+                    onChange={(e) => updateRequirements({ requireMethodOrTool: e.target.checked })}
+                  />
+                  <span>
+                    <strong>Require command / tool / method</strong>
+                    <br />
+                    <span style={{ color: "var(--text-muted)", fontSize: 13 }}>
+                      Candidate must say how they will look (for example type, ping, or PowerShell).
+                    </span>
+                  </span>
+                </label>
+                <label style={{ display: "block", marginBottom: 8, fontSize: 13 }}>
+                  Required parameter names (comma-separated)
+                  <input
+                    value={req.requiredParameters.join(", ")}
+                    disabled={status === "DISABLED" || req.intentionallyUnrestricted}
+                    onChange={(e) =>
+                      updateRequirements({
+                        requiredParameters: e.target.value
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean),
+                      })
+                    }
+                    placeholder="username, path"
+                    style={{ display: "block", width: "100%", marginTop: 4 }}
+                  />
+                  <span style={{ color: "var(--text-muted)" }}>
+                    Extra details the candidate must include in their message (not just in AI guesses).
+                  </span>
+                </label>
+                <label style={{ display: "block", marginBottom: 8, fontSize: 13 }}>
+                  Allowed target names (comma-separated)
+                  <input
+                    value={req.allowedTargets.join(", ")}
+                    disabled={status === "DISABLED" || req.intentionallyUnrestricted}
+                    onChange={(e) =>
+                      updateRequirements({
+                        allowedTargets: e.target.value
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean),
+                      })
+                    }
+                    placeholder="CLIENT-PC, Selina"
+                    style={{ display: "block", width: "100%", marginTop: 4 }}
+                  />
+                  <span style={{ color: "var(--text-muted)" }}>
+                    Optional whitelist. For communication actions, list the person or role being contacted.
+                  </span>
+                </label>
+                <label style={{ display: "block", marginBottom: 8, fontSize: 13 }}>
+                  Allowed tools / methods (comma-separated)
+                  <input
+                    value={req.allowedMethods.join(", ")}
+                    disabled={status === "DISABLED" || req.intentionallyUnrestricted}
+                    onChange={(e) =>
+                      updateRequirements({
+                        allowedMethods: e.target.value
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean),
+                      })
+                    }
+                    placeholder="type, notepad, get-content"
+                    style={{ display: "block", width: "100%", marginTop: 4 }}
+                  />
+                </label>
+                <label style={{ display: "flex", gap: 8, alignItems: "flex-start", marginBottom: 8, fontSize: 14 }}>
+                  <input
+                    type="checkbox"
+                    checked={req.intentionallyUnrestricted}
+                    disabled={status === "DISABLED"}
+                    onChange={(e) =>
+                      updateRequirements({
+                        intentionallyUnrestricted: e.target.checked,
+                        ...(e.target.checked
+                          ? {
+                              requireTargetSystem: false,
+                              requireMethodOrTool: false,
+                              requiredParameters: [],
+                              allowedTargets: [],
+                              allowedMethods: [],
+                            }
+                          : {}),
+                      })
+                    }
+                  />
+                  <span>
+                    <strong>Intentionally unrestricted</strong>
+                    <br />
+                    <span style={{ color: "var(--text-muted)", fontSize: 13 }}>
+                      Check this only when this action truly needs no target or method (rare).
+                      Empty defaults are not treated as approval.
+                    </span>
+                  </span>
+                </label>
+                <label style={{ display: "flex", gap: 8, alignItems: "flex-start", fontSize: 14 }}>
+                  <input
+                    type="checkbox"
+                    checked={req.requirementsReviewed}
+                    disabled={status === "DISABLED"}
+                    onChange={(e) => updateRequirements({ requirementsReviewed: e.target.checked })}
+                  />
+                  <span>
+                    <strong>Requirements reviewed</strong>
+                    <br />
+                    <span style={{ color: "var(--text-muted)", fontSize: 13 }}>
+                      Confirm you reviewed these rules. Publishing and new assignments require this for every action.
+                    </span>
+                  </span>
+                </label>
+              </div>
             </div>
-          ))}
+            );
+          })}
           {status !== "DISABLED" && (
             <button
               className="btn btn-secondary"
@@ -397,13 +596,10 @@ export default function TemplateEditorPage() {
                       triggers: [],
                       result: "",
                       category: "diagnostic",
-                      requirements: {
-                        requireTargetSystem: false,
-                        requireMethodOrTool: false,
-                        requiredParameters: [],
-                        allowedTargets: [],
-                        allowedMethods: [],
-                      },
+                      requirements: getDefaultActionRequirements({
+                        requireTargetSystem: true,
+                        requireMethodOrTool: true,
+                      }),
                     },
                   ],
                 })

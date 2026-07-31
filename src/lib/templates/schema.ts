@@ -27,6 +27,10 @@ export const actionRequirementSchema = z.object({
   requiredParameters: z.array(z.string()).default([]),
   allowedTargets: z.array(z.string()).default([]),
   allowedMethods: z.array(z.string()).default([]),
+  /** Explicit opt-out: action intentionally has no target/method requirements. */
+  intentionallyUnrestricted: z.boolean().default(false),
+  /** Administrator confirmed specificity settings. Absent/false = not approved. */
+  requirementsReviewed: z.boolean().default(false),
 });
 
 export const actionSchema = z.object({
@@ -41,6 +45,8 @@ export const actionSchema = z.object({
     requiredParameters: [],
     allowedTargets: [],
     allowedMethods: [],
+    intentionallyUnrestricted: false,
+    requirementsReviewed: false,
   }),
 });
 
@@ -100,9 +106,64 @@ export type ObjectiveDefinition = z.infer<typeof objectiveSchema>;
 /** @deprecated Use ObjectiveDefinition */
 export type GateDefinition = ObjectiveDefinition;
 export type RubricCategory = z.infer<typeof rubricCategorySchema>;
+export type ActionDefinition = z.infer<typeof actionSchema>;
 
 export function validateTemplateContent(content: unknown): ScenarioTemplateContent {
   return scenarioTemplateContentSchema.parse(content) as ScenarioTemplateContent;
+}
+
+export function getDefaultActionRequirements(partial?: Partial<z.infer<typeof actionRequirementSchema>>) {
+  return {
+    requireTargetSystem: false,
+    requireMethodOrTool: false,
+    requiredParameters: [] as string[],
+    allowedTargets: [] as string[],
+    allowedMethods: [] as string[],
+    intentionallyUnrestricted: false,
+    requirementsReviewed: false,
+    ...partial,
+  };
+}
+
+/** Returns human-readable blockers preventing publish/assign. */
+export function getActionSpecificityIssues(content: ScenarioTemplateContent): string[] {
+  const issues: string[] = [];
+  for (const action of content.actions) {
+    const req = action.requirements ?? getDefaultActionRequirements();
+    if (!req.requirementsReviewed) {
+      issues.push(`Action "${action.label || action.id}" has not had its specificity requirements reviewed.`);
+      continue;
+    }
+    if (req.intentionallyUnrestricted) continue;
+
+    if (
+      action.category === "diagnostic" ||
+      action.category === "remediation" ||
+      action.category === "validation"
+    ) {
+      if (!req.requireTargetSystem && !req.requireMethodOrTool && req.requiredParameters.length === 0) {
+        issues.push(
+          `Action "${action.label || action.id}" (${action.category}) needs target/tool/parameter requirements, or mark it intentionally unrestricted.`,
+        );
+      }
+    }
+    if (action.category === "communication") {
+      if (!req.requireTargetSystem && req.allowedTargets.length === 0) {
+        issues.push(
+          `Communication action "${action.label || action.id}" should require or list who is being contacted.`,
+        );
+      }
+    }
+  }
+  return issues;
+}
+
+export function canPublishTemplateContent(content: ScenarioTemplateContent): {
+  ok: boolean;
+  issues: string[];
+} {
+  const issues = getActionSpecificityIssues(content);
+  return { ok: issues.length === 0, issues };
 }
 
 export function getDefaultTemplateContent(title: string): ScenarioTemplateContent {

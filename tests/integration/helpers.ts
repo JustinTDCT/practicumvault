@@ -1,6 +1,7 @@
-import { PrismaClient, UserRole, TemplateStatus, LlmProvider } from "@prisma/client";
+import { PrismaClient, User, UserRole, TemplateStatus, LlmProvider } from "@prisma/client";
 import { hashPassword } from "../../src/lib/password";
 import { getDefaultTemplateContent } from "../../src/lib/templates/schema";
+import { AuthenticatedSession } from "../../src/lib/auth";
 
 export const prisma = new PrismaClient();
 
@@ -21,8 +22,37 @@ export async function resetTestDatabase() {
   await prisma.scenarioTemplate.deleteMany();
   await prisma.user.deleteMany();
   await prisma.position.deleteMany();
+  await prisma.loginRateBucket.deleteMany();
   await prisma.loginAttempt.deleteMany();
   await prisma.organization.deleteMany();
+}
+
+export function asSession(user: User): AuthenticatedSession {
+  return {
+    userId: user.id,
+    email: user.email,
+    role: user.role,
+    organizationId: user.organizationId,
+    sessionVersion: user.sessionVersion,
+    isLoggedIn: true,
+    user,
+  };
+}
+
+export function SECRETS_FOR(name: string): string[] {
+  return [
+    `SECRET_ROOT_CAUSE_${name}`,
+    `SECRET_HIDDEN_FACT_${name}`,
+    `SECRET_RED_HERRING_${name}`,
+    `SECRET_UNREVEALED_ACTION_RESULT_${name}`,
+    `SECRET_OBJECTIVE_NAME_${name}`,
+    `SECRET_PASS_CRITERIA_${name}`,
+    `SECRET_REQUIRED_EVIDENCE_${name}`,
+    `SECRET_RUBRIC_CATEGORY_${name}`,
+    `SECRET_HINT_TEXT_${name}`,
+    `SECRET_AI_INSTRUCTIONS_${name}`,
+    `SECRET_SCENARIO_SNAPSHOT_${name}`,
+  ];
 }
 
 export async function seedOrg(name: string) {
@@ -57,6 +87,7 @@ export async function seedOrg(name: string) {
   });
 
   const content = getDefaultTemplateContent(`${name} Scenario`);
+  content.metadata.environment = `SECRET_SCENARIO_SNAPSHOT_${name}`;
   content.environment.rootCause = `SECRET_ROOT_CAUSE_${name}`;
   content.environment.hiddenFacts = [`SECRET_HIDDEN_FACT_${name}`];
   content.environment.redHerrings = [`SECRET_RED_HERRING_${name}`];
@@ -74,11 +105,30 @@ export async function seedOrg(name: string) {
         requiredParameters: [],
         allowedTargets: ["CLIENT-PC"],
         allowedMethods: ["type"],
+        requirementsReviewed: true,
+        intentionallyUnrestricted: false,
+      },
+    },
+    {
+      id: "unrevealed-admin-note",
+      label: "Read privileged admin note",
+      triggers: ["admin note"],
+      result: `SECRET_UNREVEALED_ACTION_RESULT_${name}`,
+      category: "diagnostic",
+      requirements: {
+        requireTargetSystem: true,
+        requireMethodOrTool: true,
+        requiredParameters: [],
+        allowedTargets: ["ADMIN-PC"],
+        allowedMethods: ["type"],
+        requirementsReviewed: true,
+        intentionallyUnrestricted: false,
       },
     },
   ];
   content.objectives[0].name = `SECRET_OBJECTIVE_NAME_${name}`;
   content.objectives[0].passCriteria = `SECRET_PASS_CRITERIA_${name}`;
+  content.objectives[0].requiredEvidence = [`SECRET_REQUIRED_EVIDENCE_${name}`];
   content.scoringRubric.categories[0].name = `SECRET_RUBRIC_CATEGORY_${name}`;
   content.hints = [{ level: 1, text: `SECRET_HINT_TEXT_${name}`, penalty: 5 }];
 

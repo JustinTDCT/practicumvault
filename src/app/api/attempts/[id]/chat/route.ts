@@ -1,13 +1,13 @@
-import { streamText } from "ai";
 import { NextRequest } from "next/server";
+import { randomUUID } from "crypto";
 import { requireAuth } from "@/lib/auth";
 import { prisma } from "@/lib/db";
 import { formatModelLabel, getLanguageModelForAttempt } from "@/lib/ai/provider";
-import { classifyCandidateIntent } from "@/lib/ai/classifier";
 import {
   ANSWER_SEEKING_REFUSAL,
   DELEGATION_REFUSAL,
   PROMPT_ATTACK_REFUSAL,
+  classifyCandidateIntent,
 } from "@/lib/ai/classifier";
 import {
   buildStaticResponse,
@@ -18,8 +18,8 @@ import {
 import { validateClassifiedAction } from "@/lib/ai/validate-action";
 import {
   formatDeterministicEvidence,
+  generateValidatedDialogue,
   inferEvidenceFormat,
-  validateDialogueOutput,
 } from "@/lib/ai/format-evidence";
 import { TurnStructuredRecord } from "@/lib/ai/types";
 import { createPolicyViolationStreamResponse } from "@/lib/ai/cheat-detection";
@@ -34,8 +34,7 @@ import {
 import { detectUnsafeActionDeterministic } from "@/lib/scoring/unsafe-actions";
 import { evaluateCurrentObjective, submitAttempt } from "@/lib/scoring/engine";
 import { LIMITS, POLICY_VIOLATION_PENALTY } from "@/lib/config/limits";
-import { AttemptStatus, UserRole } from "@prisma/client";
-import { Prisma } from "@prisma/client";
+import { AttemptStatus, UserRole, Prisma } from "@prisma/client";
 
 type ChatAttempt = Prisma.AttemptGetPayload<{
   include: {
@@ -45,9 +44,9 @@ type ChatAttempt = Prisma.AttemptGetPayload<{
   };
 }>;
 
-async function loadChatAttempt(attemptId: string, candidateId: string): Promise<ChatAttempt | null> {
+async function loadChatAttempt(attemptId: string, candidateId: string, organizationId: string): Promise<ChatAttempt | null> {
   return prisma.attempt.findFirst({
-    where: { id: attemptId, candidateId },
+    where: { id: attemptId, candidateId, organizationId },
     include: {
       messages: { orderBy: { createdAt: "asc" } },
       scenarioVersion: { include: { template: true } },
@@ -62,34 +61,37 @@ function checkRateLimit(timestamps: number[], windowMs: number, max: number): bo
   return recent.length < max;
 }
 
-async function persistAssistantOnce(
+async function persistTurnAssistant(
   attemptId: string,
+  turnId: string,
   content: string,
   metadata?: Record<string, unknown>,
 ): Promise<void> {
   const trimmed = content.trim();
   if (!trimmed) return;
 
-  const recent = await prisma.attemptMessage.findFirst({
-    where: { attemptId, role: "assistant" },
-    orderBy: { createdAt: "desc" },
-  });
-  if (recent && recent.content === trimmed && Date.now() - recent.createdAt.getTime() < 5000) {
-    return;
+  try {
+    await prisma.attemptMessage.create({
+      data: {
+        attemptId,
+        turnId,
+        role: "assistant",
+        content: trimmed,
+        metadata: (metadata as object | undefined) ?? undefined,
+      },
+    });
+  } catch (err) {
+    // Unique (attemptId, turnId, role) — idempotent retry
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      return;
+    }
+    throw err;
   }
-
-  await prisma.attemptMessage.create({
-    data: {
-      attemptId,
-      role: "assistant",
-      content: trimmed,
-      metadata: (metadata as object | undefined) ?? undefined,
-    },
-  });
 }
 
 async function recordPolicyViolationIfNeeded(
   attemptId: string,
+  turnId: string,
   candidateMessageId: string,
   decision: string,
 ): Promise<void> {
@@ -105,7 +107,7 @@ async function recordPolicyViolationIfNeeded(
     where: {
       attemptId,
       type: "policy_violation",
-      payload: { path: ["candidateMessageId"], equals: candidateMessageId },
+      payload: { path: ["turnId"], equals: turnId },
     },
   });
   if (existing) return;
@@ -115,6 +117,7 @@ async function recordPolicyViolationIfNeeded(
       attemptId,
       type: "policy_violation",
       payload: {
+        turnId,
         candidateMessageId,
         category: decision,
         penalty: POLICY_VIOLATION_PENALTY,
@@ -134,11 +137,25 @@ export async function POST(
 
   const { id: attemptId } = await params;
   const body = await request.json();
-  const { message, action } = body as { message?: string; action?: string };
+  const { message, action, turnId: clientTurnId } = body as {
+    message?: string;
+    action?: string;
+    turnId?: string;
+  };
 
-  await expireAttemptIfNeeded(attemptId);
+  // Authorize first — never expire unscoped IDs
+  let attempt = await loadChatAttempt(attemptId, session.userId, session.organizationId);
+  if (!attempt) {
+    return new Response("Not found", { status: 404 });
+  }
 
-  const attempt = await loadChatAttempt(attemptId, session.userId);
+  await expireAttemptIfNeeded({
+    attemptId,
+    candidateId: session.userId,
+    organizationId: session.organizationId,
+  });
+
+  attempt = await loadChatAttempt(attemptId, session.userId, session.organizationId);
   if (!attempt) {
     return new Response("Not found", { status: 404 });
   }
@@ -151,10 +168,11 @@ export async function POST(
     return Response.json({ error: "Organization configuration unavailable" }, { status: 500 });
   }
 
-  const content = getAttemptScenarioContent(attempt);
   if (!attempt.scenarioSnapshot) {
     return Response.json({ error: "Attempt snapshot missing" }, { status: 500 });
   }
+
+  const content = getAttemptScenarioContent(attempt);
   const snapshot = getSnapshotFromAttempt(attempt);
 
   if (action === "complete") {
@@ -209,9 +227,11 @@ export async function POST(
           },
         });
 
+        const hintTurnId = `hint-${hintIndex + 1}`;
         await tx.attemptMessage.create({
           data: {
             attemptId,
+            turnId: hintTurnId,
             role: "assistant",
             content: `**Hint (Level ${hint.level})**\n\n${hint.text}`,
             metadata: { type: "hint", level: hint.level, penalty: hint.penalty },
@@ -222,7 +242,7 @@ export async function POST(
           data: {
             attemptId,
             type: "hint_requested",
-            payload: { level: hint.level, penalty: hint.penalty, hintIndex },
+            payload: { level: hint.level, penalty: hint.penalty, hintIndex, turnId: hintTurnId },
           },
         });
 
@@ -260,14 +280,32 @@ export async function POST(
     take: LIMITS.candidateMessageRatePerMinute,
     select: { createdAt: true },
   });
-  const timestamps = recentMessages.map((m) => m.createdAt.getTime());
-  if (!checkRateLimit(timestamps, 60_000, LIMITS.candidateMessageRatePerMinute)) {
+  if (!checkRateLimit(recentMessages.map((m) => m.createdAt.getTime()), 60_000, LIMITS.candidateMessageRatePerMinute)) {
     return Response.json({ error: "Message rate limit exceeded" }, { status: 429 });
   }
 
-  const userMessage = await prisma.attemptMessage.create({
-    data: { attemptId, role: "user", content: message.trim() },
-  });
+  const turnId =
+    typeof clientTurnId === "string" && clientTurnId.length >= 8 && clientTurnId.length <= 80
+      ? clientTurnId
+      : randomUUID();
+
+  let userMessage;
+  try {
+    userMessage = await prisma.attemptMessage.create({
+      data: { attemptId, turnId, role: "user", content: message.trim() },
+    });
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      const existingAssistant = await prisma.attemptMessage.findFirst({
+        where: { attemptId, turnId, role: "assistant" },
+      });
+      if (existingAssistant) {
+        return createPolicyViolationStreamResponse(existingAssistant.content);
+      }
+      return Response.json({ error: "Turn already in progress" }, { status: 409 });
+    }
+    throw err;
+  }
 
   await prisma.attempt.update({
     where: { id: attemptId },
@@ -304,7 +342,7 @@ export async function POST(
       data: {
         attemptId,
         type: "unsafe_action",
-        payload: unsafeRecord as object,
+        payload: { ...unsafeRecord, turnId } as object,
       },
     });
   }
@@ -316,6 +354,7 @@ export async function POST(
 
   let evidenceIds: string[] = [];
   let responseText: string | null = null;
+  let dialogueFallback = false;
 
   if (validated.decision === "VALID_ACTION" && validated.approvedActionId) {
     const matched = content.actions.find((a) => a.id === validated.approvedActionId)!;
@@ -332,60 +371,20 @@ export async function POST(
 
     const format = inferEvidenceFormat(matched.category, matched.label);
     if (format === "dialogue") {
-      const turnRecord: TurnStructuredRecord = {
-        candidateMessageId: userMessage.id,
-        classificationDecision: validated.decision,
-        targetSystem: classification.targetSystem,
-        methodOrTool: classification.methodOrTool,
-        requestedAction: classification.requestedAction,
-        parameters: classification.parameters,
-        matchedActionId: validated.approvedActionId,
-        missingFields: classification.missingFields,
-        responseType,
-        evidenceIds,
-        classifierModel: modelLabel,
-        responderModel: modelLabel,
-      };
-
-      await prisma.attempt.update({
-        where: { id: attemptId },
-        data: {
-          classifierModel: modelLabel,
-          responderModel: modelLabel,
-          modelCallsCount: { increment: 2 },
-        },
-      });
-      await prisma.attemptEvent.create({
-        data: { attemptId, type: "turn_classified", payload: turnRecord as object },
-      });
-
-      const result = streamText({
+      const dialogue = await generateValidatedDialogue({
         model,
-        prompt: `Format an end-user dialogue using ONLY these approved facts. No suggestions. No next steps.
-
-Approved facts:
-"""
-${selected.evidence}
-"""
-
-Candidate request: ${message.trim()}`,
-        onFinish: async ({ text: finished }) => {
-          const validatedOut = validateDialogueOutput(finished, selected.evidence);
-          await persistAssistantOnce(attemptId, validatedOut.text, {
-            responseType,
-            matchedActionId: matched.id,
-          });
-        },
+        approvedFacts: selected.evidence,
+        candidateRequest: message.trim(),
       });
-
-      return result.toDataStreamResponse();
+      responseText = dialogue.text;
+      dialogueFallback = dialogue.usedFallback;
+    } else {
+      responseText = formatDeterministicEvidence(
+        selected.evidence,
+        format,
+        classification.targetSystem,
+      );
     }
-
-    responseText = formatDeterministicEvidence(
-      selected.evidence,
-      format,
-      classification.targetSystem,
-    );
   } else if (validated.decision === "REFERENCE_QUESTION") {
     responseText = await formatReferenceResponse(model, message.trim());
   } else if (validated.clarification) {
@@ -406,6 +405,7 @@ Candidate request: ${message.trim()}`,
         attemptId,
         type: "action_validation_failed",
         payload: {
+          turnId,
           candidateMessageId: userMessage.id,
           reason: validated.validationReason,
           classifierDecision: rawClassification.decision,
@@ -413,6 +413,10 @@ Candidate request: ${message.trim()}`,
         },
       },
     });
+  }
+
+  if (!responseText) {
+    responseText = "That action is not available in this environment.";
   }
 
   const turnRecord: TurnStructuredRecord = {
@@ -443,20 +447,19 @@ Candidate request: ${message.trim()}`,
     data: {
       attemptId,
       type: "turn_classified",
-      payload: turnRecord as object,
+      payload: { ...turnRecord, turnId, dialogueFallback } as object,
     },
   });
 
-  await recordPolicyViolationIfNeeded(attemptId, userMessage.id, validated.decision);
+  await recordPolicyViolationIfNeeded(attemptId, turnId, userMessage.id, validated.decision);
 
-  if (!responseText) {
-    responseText = "That action is not available in this environment.";
-  }
-
-  await persistAssistantOnce(attemptId, responseText, {
+  await persistTurnAssistant(attemptId, turnId, responseText, {
     responseType,
     classificationDecision: validated.decision,
+    dialogueFallback,
+    turnId,
   });
 
+  // Return exactly the persisted validated text — never stream unvalidated dialogue
   return createPolicyViolationStreamResponse(responseText);
 }

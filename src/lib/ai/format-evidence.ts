@@ -3,6 +3,8 @@
  * Stored snapshot text is the source of truth — no generative rewriting.
  */
 
+import { generateText, LanguageModel } from "ai";
+
 export type EvidenceFormat = "command" | "log" | "file" | "console" | "dialogue" | "raw";
 
 export function inferEvidenceFormat(category: string, label: string): EvidenceFormat {
@@ -73,21 +75,68 @@ const PROHIBITED_DIALOGUE_PATTERNS = [
   /\bobjective\b/i,
   /\brubric\b/i,
   /\bhidden\s+fact\b/i,
+  /\bpass\s+criteria\b/i,
+  /\bscoring\b/i,
+  /\bthis (suggests|indicates|means)\b/i,
+  /\blikely caused\b/i,
 ];
 
 export function validateDialogueOutput(
   text: string,
   approvedFacts: string,
   maxLength = 2000,
-): { ok: boolean; text: string } {
+): { ok: boolean; text: string; reason: string | null } {
   const trimmed = text.trim();
-  if (!trimmed || trimmed.length > maxLength) {
-    return { ok: false, text: approvedFacts };
+  if (!trimmed) {
+    return { ok: false, text: approvedFacts.trim(), reason: "empty" };
+  }
+  if (trimmed.length > maxLength) {
+    return { ok: false, text: approvedFacts.trim(), reason: "too_long" };
   }
   for (const pattern of PROHIBITED_DIALOGUE_PATTERNS) {
     if (pattern.test(trimmed) && !pattern.test(approvedFacts)) {
-      return { ok: false, text: approvedFacts };
+      return { ok: false, text: approvedFacts.trim(), reason: "prohibited_content" };
     }
   }
-  return { ok: true, text: trimmed };
+  return { ok: true, text: trimmed, reason: null };
+}
+
+export interface SafeDialogueResult {
+  text: string;
+  usedFallback: boolean;
+  reason: string | null;
+}
+
+/**
+ * Generate dialogue completely, validate, then return only safe text.
+ * Never streams unvalidated tokens to the candidate.
+ */
+export async function generateValidatedDialogue(options: {
+  model: LanguageModel;
+  approvedFacts: string;
+  candidateRequest: string;
+  maxLength?: number;
+}): Promise<SafeDialogueResult> {
+  const approved = options.approvedFacts.trim();
+  try {
+    const { text } = await generateText({
+      model: options.model,
+      prompt: `Format an end-user dialogue using ONLY these approved facts.
+No suggestions. No next steps. No interpretations. No root-cause conclusions.
+
+Approved facts:
+"""
+${approved}
+"""
+
+Candidate request: ${options.candidateRequest}`,
+    });
+    const validated = validateDialogueOutput(text, approved, options.maxLength ?? 2000);
+    if (!validated.ok) {
+      return { text: validated.text, usedFallback: true, reason: validated.reason };
+    }
+    return { text: validated.text, usedFallback: false, reason: null };
+  } catch {
+    return { text: approved, usedFallback: true, reason: "generation_error" };
+  }
 }

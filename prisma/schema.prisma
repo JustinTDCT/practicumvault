@@ -209,6 +209,7 @@ model Attempt {
   scoringPromptVersion String? @map("scoring_prompt_version")
   scoringEngineVersion String? @map("scoring_engine_version")
   scoringAttempts Int @default(0) @map("scoring_attempts")
+  lastScoringFailure Json? @map("last_scoring_failure")
 
   organizationId String       @map("organization_id")
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
@@ -236,12 +237,15 @@ model AttemptMessage {
   role      String
   content   String   @db.Text
   metadata  Json?
+  turnId    String?  @map("turn_id")
   createdAt DateTime @default(now()) @map("created_at")
 
   attemptId String  @map("attempt_id")
   attempt   Attempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
 
+  @@unique([attemptId, turnId, role])
   @@index([attemptId, createdAt])
+  @@index([attemptId, turnId])
 }
 
 model AttemptEvent {
@@ -264,5 +268,18 @@ model LoginAttempt {
   createdAt DateTime @default(now()) @map("created_at")
 
   @@index([email, createdAt])
+  @@index([ipAddress, createdAt])
   @@map("login_attempts")
+}
+
+model LoginRateBucket {
+  id           String   @id @default(cuid())
+  bucketKey    String   @map("bucket_key")
+  windowStart  DateTime @map("window_start")
+  failureCount Int      @default(0) @map("failure_count")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  @@unique([bucketKey, windowStart])
+  @@index([windowStart])
+  @@map("login_rate_buckets")
 }

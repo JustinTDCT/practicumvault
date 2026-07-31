@@ -1,5 +1,5 @@
 import { Attempt, AttemptMessage, ScenarioVersion, ScenarioTemplate, User } from "@prisma/client";
-import { parseScenarioSnapshot } from "@/lib/attempts/snapshot";
+import { SnapshotIntegrityError, requireAttemptSnapshot } from "@/lib/attempts/snapshot";
 
 type AttemptForTranscript = Attempt & {
   candidate: User;
@@ -16,23 +16,23 @@ function slugify(value: string): string {
 }
 
 function snapshotMeta(attempt: AttemptForTranscript) {
-  if (attempt.scenarioSnapshot) {
-    try {
-      const snap = parseScenarioSnapshot(attempt.scenarioSnapshot);
-      return { title: snap.templateTitle, version: snap.versionDisplay };
-    } catch {
-      // fall through
-    }
+  const snap = requireAttemptSnapshot(attempt);
+  if (!snap.templateSlug) {
+    throw new SnapshotIntegrityError(
+      "Historical scenario snapshot is missing templateSlug. Run snapshot backfill.",
+    );
   }
   return {
-    title: attempt.scenarioVersion.template.title,
-    version: attempt.scenarioVersion.version,
+    title: snap.templateTitle,
+    version: snap.versionDisplay,
+    slug: snap.templateSlug,
   };
 }
 
 export function buildTranscriptFilename(attempt: AttemptForTranscript): string {
   const candidate = slugify(attempt.candidate.fullName || "candidate");
-  const scenario = slugify(attempt.scenarioVersion.template.slug || "scenario");
+  const meta = snapshotMeta(attempt);
+  const scenario = slugify(meta.slug || "scenario");
   return `practicum-transcript-${candidate}-${scenario}-${attempt.id.slice(0, 8)}.txt`;
 }
 
@@ -44,7 +44,7 @@ export function formatAttemptTranscript(attempt: AttemptForTranscript): string {
     "",
     `Candidate: ${attempt.candidate.fullName}`,
     `Email: ${attempt.candidate.email}`,
-    `Scenario: ${meta.title} (v${meta.version})`,
+    `Scenario: ${meta.title} (v${meta.version}) [${meta.slug}]`,
     `Status: ${attempt.status}`,
     `Started: ${attempt.startedAt.toLocaleString()}`,
     `Submitted: ${attempt.submittedAt?.toLocaleString() ?? "—"}`,

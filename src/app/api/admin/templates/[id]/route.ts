@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
 import { prisma } from "@/lib/db";
+import { canPublishTemplateContent, validateTemplateContent } from "@/lib/templates/schema";
 import { UserRole, TemplateStatus } from "@prisma/client";
 
 export async function POST(
@@ -26,6 +27,17 @@ export async function POST(
   if (action === "publish") {
     if (version.status !== TemplateStatus.DRAFT) {
       return NextResponse.json({ error: "Only drafts can be published" }, { status: 400 });
+    }
+    const content = validateTemplateContent(version.content);
+    const gate = canPublishTemplateContent(content);
+    if (!gate.ok) {
+      return NextResponse.json(
+        {
+          error: "Action specificity requirements must be reviewed before publishing.",
+          issues: gate.issues,
+        },
+        { status: 400 },
+      );
     }
     const updated = await prisma.scenarioVersion.update({
       where: { id: versionId },

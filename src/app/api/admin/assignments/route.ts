@@ -3,6 +3,7 @@ import { requireAuth } from "@/lib/auth";
 import { prisma } from "@/lib/db";
 import { allowAssignmentRetake } from "@/lib/attempts/service";
 import { verifyOrgCandidate, verifyOrgPosition, verifyOrgTemplate, OrgAccessError } from "@/lib/org/verify";
+import { canPublishTemplateContent, validateTemplateContent } from "@/lib/templates/schema";
 import { UserRole, AssignmentStatus, TemplateStatus } from "@prisma/client";
 
 export async function GET() {
@@ -57,6 +58,18 @@ export async function POST(request: NextRequest) {
   });
   if (!version) {
     return NextResponse.json({ error: "No published version available for this template" }, { status: 400 });
+  }
+
+  const content = validateTemplateContent(version.content);
+  const gate = canPublishTemplateContent(content);
+  if (!gate.ok) {
+    return NextResponse.json(
+      {
+        error: "This published scenario has unreviewed action specificity requirements. Edit and review actions before assigning.",
+        issues: gate.issues,
+      },
+      { status: 400 },
+    );
   }
 
   const assignment = await prisma.assignment.create({

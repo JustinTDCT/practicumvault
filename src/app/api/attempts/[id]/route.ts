@@ -7,24 +7,9 @@ import {
   getTimerState,
   parseObjectiveStates,
 } from "@/lib/attempts/service";
-import { parseScenarioSnapshot } from "@/lib/attempts/snapshot";
+import { SnapshotIntegrityError, requireAttemptSnapshot } from "@/lib/attempts/snapshot";
 import { CandidateAttemptDto } from "@/lib/dto/candidate";
 import { AttemptStatus, UserRole } from "@prisma/client";
-
-function getSnapshotMeta(attempt: { scenarioSnapshot: unknown; scenarioVersion: { version: string; template: { title: string } } }) {
-  if (attempt.scenarioSnapshot) {
-    try {
-      const snap = parseScenarioSnapshot(attempt.scenarioSnapshot);
-      return { title: snap.templateTitle, version: snap.versionDisplay };
-    } catch {
-      // fall through
-    }
-  }
-  return {
-    title: attempt.scenarioVersion.template.title,
-    version: attempt.scenarioVersion.version,
-  };
-}
 
 export async function GET(
   _request: NextRequest,
@@ -34,8 +19,23 @@ export async function GET(
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const { id: attemptId } = await params;
+  const isAdmin = session.role === UserRole.ADMIN;
 
-  await expireAttemptIfNeeded(attemptId);
+  const authorized = await prisma.attempt.findFirst({
+    where: {
+      id: attemptId,
+      organizationId: session.organizationId,
+      ...(isAdmin ? {} : { candidateId: session.userId }),
+    },
+    select: { id: true, candidateId: true },
+  });
+  if (!authorized) return NextResponse.json({ error: "Not found" }, { status: 404 });
+
+  await expireAttemptIfNeeded({
+    attemptId,
+    organizationId: session.organizationId,
+    ...(isAdmin ? {} : { candidateId: session.userId }),
+  });
 
   const attempt = await prisma.attempt.findFirst({
     where: { id: attemptId, organizationId: session.organizationId },
@@ -60,6 +60,7 @@ export async function GET(
       scoringEngineVersion: true,
       scoringModel: true,
       scoringAttempts: true,
+      lastScoringFailure: true,
       scenarioSnapshot: true,
       candidateId: true,
       organization: {
@@ -71,12 +72,6 @@ export async function GET(
       candidate: {
         select: { fullName: true },
       },
-      scenarioVersion: {
-        select: {
-          version: true,
-          template: { select: { title: true } },
-        },
-      },
       messages: {
         orderBy: { createdAt: "asc" },
         select: {
@@ -84,6 +79,7 @@ export async function GET(
           role: true,
           content: true,
           createdAt: true,
+          turnId: true,
         },
       },
     },
@@ -91,15 +87,27 @@ export async function GET(
 
   if (!attempt) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-  const isAdmin = session.role === UserRole.ADMIN;
-  const isOwner = attempt.candidateId === session.userId;
-  if (!isAdmin && !isOwner) {
-    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  let meta: { title: string; version: string; slug: string };
+  try {
+    const snap = requireAttemptSnapshot(attempt);
+    meta = { title: snap.templateTitle, version: snap.versionDisplay, slug: snap.templateSlug };
+  } catch (err) {
+    if (isAdmin) {
+      return NextResponse.json(
+        {
+          error:
+            err instanceof SnapshotIntegrityError
+              ? err.message
+              : "Historical scenario snapshot is missing or invalid. Run snapshot backfill.",
+        },
+        { status: 409 },
+      );
+    }
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
   const endAt = attempt.submittedAt ?? attempt.completedAt ?? undefined;
   const timer = getTimerState(attempt.startedAt, attempt.expiresAt, endAt ?? undefined);
-  const meta = getSnapshotMeta(attempt);
 
   if (!isAdmin) {
     const response: CandidateAttemptDto = {
@@ -128,6 +136,14 @@ export async function GET(
     return NextResponse.json(response);
   }
 
+  const failure = attempt.lastScoringFailure as {
+    at?: string;
+    category?: string;
+    retryable?: boolean;
+    model?: string;
+    scoringAttempt?: number;
+  } | null;
+
   return NextResponse.json({
     attempt: {
       id: attempt.id,
@@ -143,15 +159,26 @@ export async function GET(
       timer,
       scenarioTitle: meta.title,
       scenarioVersion: meta.version,
+      scenarioSlug: meta.slug,
       candidateName: attempt.candidate.fullName,
       scoringAttempts: attempt.scoringAttempts,
       scoringModel: attempt.scoringModel,
+      lastScoringFailure: failure
+        ? {
+            at: failure.at ?? null,
+            category: failure.category ?? "scoring_error",
+            retryable: failure.retryable ?? true,
+            model: failure.model ?? attempt.scoringModel ?? null,
+            scoringAttempt: failure.scoringAttempt ?? attempt.scoringAttempts,
+          }
+        : null,
     },
     messages: attempt.messages.map((m) => ({
       id: m.id,
       role: m.role,
       content: m.content,
       createdAt: m.createdAt,
+      turnId: m.turnId,
     })),
     timerSettings: {
       showCountdown: attempt.organization.showCountdownTimer,
@@ -180,24 +207,27 @@ export async function DELETE(
   if (!session) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const { id: attemptId } = await params;
+  const isAdmin = session.role === UserRole.ADMIN;
+
   const attempt = await prisma.attempt.findFirst({
-    where: { id: attemptId, organizationId: session.organizationId },
+    where: {
+      id: attemptId,
+      organizationId: session.organizationId,
+      ...(isAdmin ? {} : { candidateId: session.userId }),
+    },
     select: { id: true, status: true, candidateId: true },
   });
   if (!attempt) {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
 
-  const isAdmin = session.role === UserRole.ADMIN;
-  const isOwner = attempt.candidateId === session.userId;
-  if (!isAdmin && !isOwner) {
-    return NextResponse.json({ error: "Forbidden" }, { status: 403 });
-  }
-
   if (attempt.status !== AttemptStatus.IN_PROGRESS) {
     return NextResponse.json({ error: "Attempt is not in progress" }, { status: 400 });
   }
 
-  await abortAttempt(attemptId, isAdmin ? "admin" : "candidate");
+  await abortAttempt(attemptId, isAdmin ? "admin" : "candidate", {
+    organizationId: session.organizationId,
+    ...(isAdmin ? {} : { candidateId: session.userId }),
+  });
   return NextResponse.json({ success: true });
 }

@@ -1,6 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("ai", () => ({
+  generateText: vi.fn(),
+}));
+
+import { generateText } from "ai";
 import {
   formatDeterministicEvidence,
+  generateValidatedDialogue,
   validateDialogueOutput,
 } from "@/lib/ai/format-evidence";
 
@@ -46,6 +53,27 @@ describe("deterministic evidence formatting", () => {
     const result = validateDialogueOutput(bad, approved);
     expect(result.ok).toBe(false);
     expect(result.text).toBe(approved);
+  });
+
+  it("returns only approved fallback when generated dialogue contains malicious coaching", async () => {
+    const approved = "Selina: Only my PC has the issue.";
+    vi.mocked(generateText).mockResolvedValue({
+      text: "Selina: The root cause is the hosts file. You should check DNS next.",
+    } as Awaited<ReturnType<typeof generateText>>);
+
+    const result = await generateValidatedDialogue({
+      model: { modelId: "test-model" } as never,
+      approvedFacts: approved,
+      candidateRequest: "Call Selina",
+    });
+
+    expect(result).toEqual({
+      text: approved,
+      usedFallback: true,
+      reason: "prohibited_content",
+    });
+    expect(result.text).not.toContain("root cause");
+    expect(result.text).not.toContain("You should");
   });
 });
 

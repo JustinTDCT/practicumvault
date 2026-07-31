@@ -79,12 +79,34 @@ export function isAttemptAcceptingMessages(status: AttemptStatus): boolean {
   return status === AttemptStatus.IN_PROGRESS;
 }
 
-export async function expireAttemptIfNeeded(attemptId: string) {
-  const attempt = await prisma.attempt.findUnique({ where: { id: attemptId } });
+export type ExpireScope = {
+  attemptId: string;
+  organizationId?: string;
+  candidateId?: string;
+};
+
+/**
+ * Expire an authorized attempt. Prefer passing organizationId/candidateId
+ * after access has already been established.
+ */
+export async function expireAttemptIfNeeded(scope: string | ExpireScope) {
+  const attemptId = typeof scope === "string" ? scope : scope.attemptId;
+  const organizationId = typeof scope === "string" ? undefined : scope.organizationId;
+  const candidateId = typeof scope === "string" ? undefined : scope.candidateId;
+
+  const attempt = await prisma.attempt.findFirst({
+    where: {
+      id: attemptId,
+      ...(organizationId ? { organizationId } : {}),
+      ...(candidateId ? { candidateId } : {}),
+    },
+  });
   if (!attempt || attempt.status !== AttemptStatus.IN_PROGRESS) return attempt;
 
-  if (isAttemptExpired(attempt.expiresAt)) {
-    await prisma.attempt.update({
+  if (!isAttemptExpired(attempt.expiresAt)) return attempt;
+
+  return prisma.$transaction(async (tx) => {
+    const claimed = await tx.attempt.updateMany({
       where: { id: attemptId, status: AttemptStatus.IN_PROGRESS },
       data: {
         status: AttemptStatus.TIMED_OUT,
@@ -94,20 +116,34 @@ export async function expireAttemptIfNeeded(attemptId: string) {
         aiRecommendation: "Timed out — session invalid. Candidate must start a new attempt.",
       },
     });
-    await prisma.assignment.update({
-      where: { id: attempt.assignmentId },
+    if (claimed.count !== 1) {
+      return tx.attempt.findUnique({ where: { id: attemptId } });
+    }
+
+    await tx.assignment.updateMany({
+      where: {
+        id: attempt.assignmentId,
+        status: { in: [AssignmentStatus.IN_PROGRESS, AssignmentStatus.PENDING] },
+      },
       data: { status: AssignmentStatus.TIMED_OUT },
     });
-    await prisma.attemptEvent.create({
-      data: {
-        attemptId,
-        type: "timed_out",
-        payload: { at: new Date().toISOString() },
-      },
+
+    const existing = await tx.attemptEvent.findFirst({
+      where: { attemptId, type: "timed_out" },
+      select: { id: true },
     });
-    return prisma.attempt.findUnique({ where: { id: attemptId } });
-  }
-  return attempt;
+    if (!existing) {
+      await tx.attemptEvent.create({
+        data: {
+          attemptId,
+          type: "timed_out",
+          payload: { at: new Date().toISOString() },
+        },
+      });
+    }
+
+    return tx.attempt.findUnique({ where: { id: attemptId } });
+  });
 }
 
 export async function reconcileExpiredAttemptsForCandidate(candidateId: string): Promise<void> {
@@ -117,52 +153,87 @@ export async function reconcileExpiredAttemptsForCandidate(candidateId: string):
       status: AttemptStatus.IN_PROGRESS,
       expiresAt: { lte: new Date() },
     },
+    select: { id: true, organizationId: true },
   });
   for (const attempt of expired) {
-    await expireAttemptIfNeeded(attempt.id);
+    await expireAttemptIfNeeded({
+      attemptId: attempt.id,
+      candidateId,
+      organizationId: attempt.organizationId,
+    });
   }
 }
 
-export async function reconcileExpiredAttempts(): Promise<number> {
+export async function reconcileExpiredAttempts(organizationId?: string): Promise<number> {
   const expired = await prisma.attempt.findMany({
     where: {
       status: AttemptStatus.IN_PROGRESS,
       expiresAt: { lte: new Date() },
+      ...(organizationId ? { organizationId } : {}),
     },
-    select: { id: true },
+    select: { id: true, organizationId: true },
   });
-  for (const { id } of expired) {
-    await expireAttemptIfNeeded(id);
+  for (const row of expired) {
+    await expireAttemptIfNeeded({
+      attemptId: row.id,
+      organizationId: row.organizationId,
+    });
   }
   return expired.length;
 }
 
-export async function abortAttempt(attemptId: string, reason: "candidate" | "admin") {
-  const attempt = await prisma.attempt.findUnique({ where: { id: attemptId } });
-  if (!attempt || attempt.status !== AttemptStatus.IN_PROGRESS) {
-    throw new Error("Attempt is not in progress.");
-  }
+export async function abortAttempt(
+  attemptId: string,
+  reason: "candidate" | "admin",
+  scope?: { organizationId?: string; candidateId?: string },
+) {
+  return prisma.$transaction(async (tx) => {
+    const attempt = await tx.attempt.findFirst({
+      where: {
+        id: attemptId,
+        ...(scope?.organizationId ? { organizationId: scope.organizationId } : {}),
+        ...(scope?.candidateId ? { candidateId: scope.candidateId } : {}),
+      },
+    });
+    if (!attempt || attempt.status !== AttemptStatus.IN_PROGRESS) {
+      throw new Error("Attempt is not in progress.");
+    }
 
-  await prisma.attempt.update({
-    where: { id: attemptId, status: AttemptStatus.IN_PROGRESS },
-    data: {
-      status: AttemptStatus.ABORTED,
-      completedAt: new Date(),
-      overallScore: 0,
-      scoringComplete: true,
-      aiRecommendation: `Aborted by ${reason} — session invalid. Score: 0.`,
-    },
-  });
-  await prisma.assignment.update({
-    where: { id: attempt.assignmentId },
-    data: { status: AssignmentStatus.ABORTED },
-  });
-  await prisma.attemptEvent.create({
-    data: {
-      attemptId,
-      type: "aborted",
-      payload: { by: reason, at: new Date().toISOString() },
-    },
+    const claimed = await tx.attempt.updateMany({
+      where: { id: attemptId, status: AttemptStatus.IN_PROGRESS },
+      data: {
+        status: AttemptStatus.ABORTED,
+        completedAt: new Date(),
+        overallScore: 0,
+        scoringComplete: true,
+        aiRecommendation: `Aborted by ${reason} — session invalid. Score: 0.`,
+      },
+    });
+    if (claimed.count !== 1) {
+      throw new Error("Attempt is not in progress.");
+    }
+
+    await tx.assignment.updateMany({
+      where: {
+        id: attempt.assignmentId,
+        status: { in: [AssignmentStatus.IN_PROGRESS, AssignmentStatus.PENDING] },
+      },
+      data: { status: AssignmentStatus.ABORTED },
+    });
+
+    const existing = await tx.attemptEvent.findFirst({
+      where: { attemptId, type: "aborted" },
+      select: { id: true },
+    });
+    if (!existing) {
+      await tx.attemptEvent.create({
+        data: {
+          attemptId,
+          type: "aborted",
+          payload: { by: reason, at: new Date().toISOString() },
+        },
+      });
+    }
   });
 }
 

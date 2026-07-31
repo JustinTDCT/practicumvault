@@ -1,6 +1,6 @@
 import { Attempt, ScenarioVersion, ScenarioTemplate, User, Assignment, Position } from "@prisma/client";
 import { ObjectiveState, formatDuration, parseObjectiveStates } from "@/lib/attempts/service";
-import { parseScenarioSnapshot } from "@/lib/attempts/snapshot";
+import { SnapshotIntegrityError, requireAttemptSnapshot } from "@/lib/attempts/snapshot";
 import { ReportData } from "@/lib/pdf/report";
 
 type AttemptWithRelations = Attempt & {
@@ -10,22 +10,16 @@ type AttemptWithRelations = Attempt & {
 };
 
 function snapshotMeta(attempt: AttemptWithRelations) {
-  if (attempt.scenarioSnapshot) {
-    try {
-      const snap = parseScenarioSnapshot(attempt.scenarioSnapshot);
-      return {
-        title: snap.templateTitle,
-        version: snap.versionDisplay,
-        slug: attempt.scenarioVersion.template.slug,
-      };
-    } catch {
-      // fall through
-    }
+  const snap = requireAttemptSnapshot(attempt);
+  if (!snap.templateSlug) {
+    throw new SnapshotIntegrityError(
+      "Historical scenario snapshot is missing templateSlug. Run snapshot backfill.",
+    );
   }
   return {
-    title: attempt.scenarioVersion.template.title,
-    version: attempt.scenarioVersion.version,
-    slug: attempt.scenarioVersion.template.slug,
+    title: snap.templateTitle,
+    version: snap.versionDisplay,
+    slug: snap.templateSlug,
   };
 }
 
