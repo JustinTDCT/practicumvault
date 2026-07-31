@@ -42,7 +42,8 @@ describe("simulation behavior", () => {
   it("returns no evidence for invalid incomplete actions", () => {
     const response = buildStaticResponse({
       decision: "INCOMPLETE_ACTION",
-      targetSystem: null,
+      targetType: null,
+      target: null,
       methodOrTool: null,
       requestedAction: "check dns",
       parameters: {},
@@ -58,7 +59,8 @@ describe("simulation behavior", () => {
   it("returns neutral clarification without suggestions", () => {
     const response = buildStaticResponse({
       decision: "AMBIGUOUS_ACTION",
-      targetSystem: null,
+      targetType: null,
+      target: null,
       methodOrTool: null,
       requestedAction: "check logs",
       parameters: {},
@@ -72,7 +74,8 @@ describe("simulation behavior", () => {
   it("returns delegation refusal without next steps", () => {
     const response = buildStaticResponse({
       decision: "DELEGATION_REQUEST",
-      targetSystem: null,
+      targetType: null,
+      target: null,
       methodOrTool: null,
       requestedAction: "find root cause",
       parameters: {},

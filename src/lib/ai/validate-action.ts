@@ -1,8 +1,10 @@
 import { IntentClassification, ClassificationDecision } from "@/lib/ai/types";
 import {
   ActionDefinition,
+  ActionTargetType,
   ScenarioTemplateContent,
   getDefaultActionRequirements,
+  resolveActionTargetType,
 } from "@/lib/templates/schema";
 import { deriveClarificationQuestion } from "@/lib/ai/classifier";
 
@@ -110,7 +112,26 @@ function hasMultipleUnrelatedActions(message: string): boolean {
 }
 
 function requirementsFor(action: ActionDefinition) {
-  return action.requirements ?? getDefaultActionRequirements();
+  return action.requirements ?? getDefaultActionRequirements(undefined, { category: action.category });
+}
+
+function clarificationFor(
+  classification: IntentClassification,
+  candidateMessage: string,
+  action?: ActionDefinition | null,
+): string {
+  const targetType: ActionTargetType | null = action
+    ? resolveActionTargetType(action)
+    : classification.targetType;
+  return deriveClarificationQuestion(classification, { targetType, candidateMessage });
+}
+
+function resolveAction(
+  content: ScenarioTemplateContent,
+  classification: IntentClassification,
+): ActionDefinition | null {
+  if (!classification.matchedActionId) return null;
+  return content.actions.find((a) => a.id === classification.matchedActionId) ?? null;
 }
 
 /**
@@ -123,6 +144,7 @@ export function validateClassifiedAction(
   candidateMessage = "",
 ): ValidatedActionDecision {
   const base = { classification, clarification: null as string | null };
+  const hintedAction = resolveAction(content, classification);
 
   if (classification.decision !== "VALID_ACTION") {
     return {
@@ -135,7 +157,7 @@ export function validateClassifiedAction(
         classification.decision === "AMBIGUOUS_ACTION" ||
         classification.decision === "INCOMPLETE_ACTION" ||
         classification.decision === "MULTIPLE_ACTIONS"
-          ? deriveClarificationQuestion(classification)
+          ? clarificationFor(classification, candidateMessage, hintedAction)
           : null,
     };
   }
@@ -158,7 +180,7 @@ export function validateClassifiedAction(
       approvedActionId: null,
       validationFailed: true,
       validationReason: "missing_fields",
-      clarification: deriveClarificationQuestion(classification),
+      clarification: clarificationFor(classification, candidateMessage, hintedAction),
     };
   }
 
@@ -187,6 +209,7 @@ export function validateClassifiedAction(
   }
 
   const requirements = requirementsFor(action);
+  const targetType = resolveActionTargetType(action);
 
   // Legacy / unreviewed actions cannot unlock evidence via classifier alone
   if (!requirements.requirementsReviewed) {
@@ -196,21 +219,27 @@ export function validateClassifiedAction(
       approvedActionId: null,
       validationFailed: true,
       validationReason: "requirements_unreviewed",
-      clarification: "Which command or tool are you using?",
+      clarification: clarificationFor(
+        {
+          ...classification,
+          decision: "INCOMPLETE_ACTION",
+          missingFields: ["methodOrTool"],
+          targetType,
+        },
+        candidateMessage,
+        action,
+      ),
     };
   }
 
   const missing: string[] = [];
 
   if (!requirements.intentionallyUnrestricted) {
-    if (requirements.requireTargetSystem) {
-      if (!isMeaningfulValue(classification.targetSystem)) {
-        missing.push("targetSystem");
-      } else if (
-        candidateMessage &&
-        !messageContainsValue(candidateMessage, classification.targetSystem!)
-      ) {
-        missing.push("targetSystem");
+    if (requirements.requireTarget && targetType !== "none") {
+      if (!isMeaningfulValue(classification.target)) {
+        missing.push("target");
+      } else if (candidateMessage && !messageContainsValue(candidateMessage, classification.target!)) {
+        missing.push("target");
       }
     }
 
@@ -240,11 +269,8 @@ export function validateClassifiedAction(
     }
 
     if (requirements.allowedTargets.length > 0) {
-      if (
-        !classification.targetSystem ||
-        !matchesAllowed(classification.targetSystem, requirements.allowedTargets)
-      ) {
-        missing.push("targetSystem");
+      if (!classification.target || !matchesAllowed(classification.target, requirements.allowedTargets)) {
+        missing.push("target");
       }
     }
 
@@ -262,6 +288,7 @@ export function validateClassifiedAction(
     const adjusted: IntentClassification = {
       ...classification,
       decision: "INCOMPLETE_ACTION",
+      targetType,
       missingFields: [...new Set(missing)],
       matchedActionId: null,
     };
@@ -271,7 +298,7 @@ export function validateClassifiedAction(
       approvedActionId: null,
       validationFailed: true,
       validationReason: "requirements_not_met",
-      clarification: deriveClarificationQuestion(adjusted),
+      clarification: clarificationFor(adjusted, candidateMessage, action),
     };
   }
 

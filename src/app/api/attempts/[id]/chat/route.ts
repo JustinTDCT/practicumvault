@@ -489,7 +489,7 @@ export async function POST(
         responseText = formatDeterministicEvidence(
           selected.evidence,
           format,
-          classification.targetSystem,
+          classification.target,
         );
       }
     } else if (validated.decision === "REFERENCE_QUESTION") {
@@ -529,7 +529,8 @@ export async function POST(
     const turnRecord: TurnStructuredRecord = {
       candidateMessageId: userMessage.id,
       classificationDecision: validated.decision,
-      targetSystem: classification.targetSystem,
+      targetType: classification.targetType,
+      target: classification.target,
       methodOrTool: classification.methodOrTool,
       requestedAction: classification.requestedAction,
       parameters: classification.parameters,

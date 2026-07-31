@@ -65,7 +65,7 @@ export function buildStaticResponse(classification: IntentClassification): strin
 
 export function buildFormattingPrompt(
   evidence: string,
-  targetSystem: string | null,
+  target: string | null,
   actionLabel: string | null,
 ): string {
   return `Format the following simulation evidence for a technical practicum candidate.
@@ -77,7 +77,7 @@ Rules:
 - Label the source machine or speaker when relevant
 - Use markdown for command output, logs, or dialogue as appropriate
 
-Target system: ${targetSystem ?? "unspecified"}
+Target: ${target ?? "unspecified"}
 Action: ${actionLabel ?? "candidate request"}
 
 Evidence to format (source of truth — do not add to this):
@@ -121,12 +121,12 @@ ${approvedFacts}
 export async function formatEvidenceResponse(
   model: LanguageModel,
   evidence: string,
-  targetSystem: string | null,
+  target: string | null,
   actionLabel: string | null,
 ): Promise<string> {
   const { text } = await generateText({
     model,
-    prompt: buildFormattingPrompt(evidence, targetSystem, actionLabel),
+    prompt: buildFormattingPrompt(evidence, target, actionLabel),
   });
   return text.trim();
 }
@@ -154,12 +154,12 @@ export function streamStaticResponse(text: string): Response {
 export function streamFormattedResponse(
   model: LanguageModel,
   evidence: string,
-  targetSystem: string | null,
+  target: string | null,
   actionLabel: string | null,
 ): Response {
   const result = streamText({
     model,
-    prompt: buildFormattingPrompt(evidence, targetSystem, actionLabel),
+    prompt: buildFormattingPrompt(evidence, target, actionLabel),
   });
   return result.toDataStreamResponse();
 }

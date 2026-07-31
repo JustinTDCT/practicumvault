@@ -138,7 +138,8 @@ describe("provider call accounting (integration)", () => {
     vi.mocked(generateObject).mockResolvedValue({
       object: {
         decision: "INCOMPLETE_ACTION",
-        targetSystem: null,
+        targetType: null,
+        target: null,
         methodOrTool: null,
         requestedAction: "check something vague",
         parameters: {},

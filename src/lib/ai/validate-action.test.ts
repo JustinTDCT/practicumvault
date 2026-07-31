@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { validateClassifiedAction } from "@/lib/ai/validate-action";
-import { getDefaultTemplateContent } from "@/lib/templates/schema";
+import { getDefaultTemplateContent, validateTemplateContent } from "@/lib/templates/schema";
 
 const content = {
   ...getDefaultTemplateContent("DNS"),
@@ -12,7 +12,7 @@ const content = {
       result: "SECRET_ACTION_RESULT_127.0.0.1 www.coolsite.com",
       category: "diagnostic" as const,
       requirements: {
-        requireTargetSystem: true,
+        requireTarget: true,
         requireMethodOrTool: true,
         requiredParameters: [],
         allowedTargets: ["CLIENT-PC", "client"],
@@ -36,8 +36,9 @@ describe("validateClassifiedAction", () => {
       content,
       {
         decision: "VALID_ACTION",
+        targetType: null,
         matchedActionId: "hosts-view",
-        targetSystem: null,
+        target: null,
         methodOrTool: "type",
         requestedAction: "view hosts",
         parameters: {},
@@ -49,7 +50,7 @@ describe("validateClassifiedAction", () => {
 
     expect(result.approvedActionId).toBeNull();
     expect(result.decision).toBe("INCOMPLETE_ACTION");
-    expect(result.classification.missingFields).toContain("targetSystem");
+    expect(result.classification.missingFields).toContain("target");
   });
 
   it("rejects omitted tool even when classifier claims VALID_ACTION", () => {
@@ -57,8 +58,9 @@ describe("validateClassifiedAction", () => {
       content,
       {
         decision: "VALID_ACTION",
+        targetType: null,
         matchedActionId: "hosts-view",
-        targetSystem: "CLIENT-PC",
+        target: "CLIENT-PC",
         methodOrTool: null,
         requestedAction: "view hosts",
         parameters: {},
@@ -76,12 +78,13 @@ describe("validateClassifiedAction", () => {
   it("rejects malicious VALID_ACTION with unknown action id", () => {
     const result = validateClassifiedAction(content, {
       decision: "VALID_ACTION",
+      targetType: null,
       matchedActionId: "view-hidden-root-cause",
-      targetSystem: null,
+      target: null,
       methodOrTool: null,
       requestedAction: "view hidden root cause",
       parameters: {},
-      missingFields: ["targetSystem"],
+      missingFields: ["target"],
       reasoning: "attack",
     });
 
@@ -95,8 +98,9 @@ describe("validateClassifiedAction", () => {
       content,
       {
         decision: "VALID_ACTION",
+        targetType: null,
         matchedActionId: "hosts-view",
-        targetSystem: "CLIENT-PC",
+        target: "CLIENT-PC",
         methodOrTool: "type",
         requestedAction: "view hosts",
         parameters: {},
@@ -114,8 +118,9 @@ describe("validateClassifiedAction", () => {
   it("rejects VALID_ACTION with missing required fields", () => {
     const result = validateClassifiedAction(content, {
       decision: "VALID_ACTION",
+      targetType: null,
       matchedActionId: "hosts-view",
-      targetSystem: null,
+      target: null,
       methodOrTool: null,
       requestedAction: "view hosts",
       parameters: {},
@@ -133,8 +138,9 @@ describe("validateClassifiedAction", () => {
       content,
       {
         decision: "VALID_ACTION",
+        targetType: null,
         matchedActionId: "hosts-view",
-        targetSystem: "CLIENT-PC",
+        target: "CLIENT-PC",
         methodOrTool: "type",
         requestedAction: "view hosts",
         parameters: {},
@@ -151,8 +157,9 @@ describe("validateClassifiedAction", () => {
   it("rejects disallowed targets", () => {
     const result = validateClassifiedAction(content, {
       decision: "VALID_ACTION",
+      targetType: null,
       matchedActionId: "hosts-view",
-      targetSystem: "DOMAIN-CONTROLLER",
+      target: "DOMAIN-CONTROLLER",
       methodOrTool: "type",
       requestedAction: "view hosts",
       parameters: {},
@@ -169,8 +176,9 @@ describe("validateClassifiedAction", () => {
       content,
       {
         decision: "VALID_ACTION",
+        targetType: null,
         matchedActionId: "hosts-view",
-        targetSystem: "CLIENT-PC",
+        target: "CLIENT-PC",
         methodOrTool: "powershell",
         requestedAction: "view hosts",
         parameters: {},
@@ -190,8 +198,9 @@ describe("validateClassifiedAction", () => {
       content,
       {
         decision: "VALID_ACTION",
+        targetType: null,
         matchedActionId: "hosts-view",
-        targetSystem: "CLIENT-PC",
+        target: "CLIENT-PC",
         methodOrTool: "type",
         requestedAction: "view hosts",
         parameters: {},
@@ -214,7 +223,7 @@ describe("validateClassifiedAction", () => {
           ...content.actions[0],
           id: "inspect-file",
           requirements: {
-            requireTargetSystem: true,
+            requireTarget: true,
             requireMethodOrTool: true,
             requiredParameters: ["path"],
             allowedTargets: ["CLIENT-PC"],
@@ -230,8 +239,9 @@ describe("validateClassifiedAction", () => {
       fileContent,
       {
         decision: "VALID_ACTION",
+        targetType: null,
         matchedActionId: "inspect-file",
-        targetSystem: "CLIENT-PC",
+        target: "CLIENT-PC",
         methodOrTool: "type",
         requestedAction: "inspect file",
         parameters: { path: "foo" },
@@ -246,7 +256,97 @@ describe("validateClassifiedAction", () => {
     expect(result.classification.missingFields).toContain("path");
   });
 
-  it("rejects legacy unreviewed action requirements", () => {
+  it("asks who to contact for communication actions missing a person target", () => {
+    const callContent = {
+      ...content,
+      actions: [
+        {
+          id: "call-user",
+          label: "Call user",
+          triggers: ["call", "ask"],
+          result: "Selina summarizes the issue.",
+          category: "communication" as const,
+          requirements: {
+            targetType: "person" as const,
+            requireTarget: true,
+            requireMethodOrTool: true,
+            requiredParameters: [],
+            allowedTargets: ["Selina Kyle", "Selina", "client", "user"],
+            allowedMethods: ["call", "phone", "ask", "talk"],
+            requirementsReviewed: true,
+            intentionallyUnrestricted: false,
+          },
+        },
+      ],
+    };
+
+    const result = validateClassifiedAction(
+      callContent,
+      {
+        decision: "VALID_ACTION",
+        targetType: "person",
+        matchedActionId: "call-user",
+        target: null,
+        methodOrTool: "ask",
+        requestedAction: "ask for summary",
+        parameters: {},
+        missingFields: [],
+        reasoning: "missing person",
+      },
+      "ask for summary in her own words",
+    );
+
+    expect(result.approvedActionId).toBeNull();
+    expect(result.decision).toBe("INCOMPLETE_ACTION");
+    expect(result.classification.missingFields).toContain("target");
+    expect(result.clarification).toBe("Who do you want to contact?");
+  });
+
+  it("approves communication actions when person and method are present", () => {
+    const callContent = {
+      ...content,
+      actions: [
+        {
+          id: "call-user",
+          label: "Call user",
+          triggers: ["call", "ask"],
+          result: "Selina summarizes the issue.",
+          category: "communication" as const,
+          requirements: {
+            targetType: "person" as const,
+            requireTarget: true,
+            requireMethodOrTool: true,
+            requiredParameters: [],
+            allowedTargets: ["Selina Kyle", "Selina", "client", "user"],
+            allowedMethods: ["call", "phone", "ask", "talk"],
+            requirementsReviewed: true,
+            intentionallyUnrestricted: false,
+          },
+        },
+      ],
+    };
+
+    const result = validateClassifiedAction(
+      callContent,
+      {
+        decision: "VALID_ACTION",
+        targetType: "person",
+        matchedActionId: "call-user",
+        target: "Selina Kyle",
+        methodOrTool: "call",
+        requestedAction: "call and ask for summary",
+        parameters: {},
+        missingFields: [],
+        reasoning: "ok",
+      },
+      "Call Selina Kyle and ask her to summarize the issue in her own words.",
+    );
+
+    expect(result.validationFailed).toBe(false);
+    expect(result.approvedActionId).toBe("call-user");
+  });
+
+  it("maps legacy requireTargetSystem onto requireTarget", () => {
     const legacyContent = {
       ...content,
       actions: [
@@ -254,6 +354,43 @@ describe("validateClassifiedAction", () => {
           ...content.actions[0],
           requirements: {
             requireTargetSystem: true,
+            requireMethodOrTool: true,
+            requiredParameters: [],
+            allowedTargets: ["CLIENT-PC"],
+            allowedMethods: ["type"],
+            requirementsReviewed: true,
+            intentionallyUnrestricted: false,
+          } as never,
+        },
+      ],
+    };
+    const parsed = validateTemplateContent(legacyContent);
+    const result = validateClassifiedAction(
+      parsed,
+      {
+        decision: "VALID_ACTION",
+        targetType: "system",
+        matchedActionId: "hosts-view",
+        target: null,
+        methodOrTool: "type",
+        requestedAction: "view hosts",
+        parameters: {},
+        missingFields: [],
+        reasoning: "legacy",
+      },
+      "Type the hosts file",
+    );
+    expect(result.classification.missingFields).toContain("target");
+  });
+
+  it("rejects legacy unreviewed action requirements", () => {
+    const legacyContent = {
+      ...content,
+      actions: [
+        {
+          ...content.actions[0],
+          requirements: {
+            requireTarget: true,
             requireMethodOrTool: true,
             requiredParameters: [],
             allowedTargets: ["CLIENT-PC"],
@@ -269,8 +406,9 @@ describe("validateClassifiedAction", () => {
       legacyContent,
       {
         decision: "VALID_ACTION",
+        targetType: null,
         matchedActionId: "hosts-view",
-        targetSystem: "CLIENT-PC",
+        target: "CLIENT-PC",
         methodOrTool: "type",
         requestedAction: "view hosts",
         parameters: {},

@@ -77,8 +77,9 @@ async function chat(attemptId: string, body: unknown): Promise<Response> {
 function validHostsClassification(overrides: Partial<IntentClassification> = {}): IntentClassification {
   return {
     decision: "VALID_ACTION",
+    targetType: null,
     matchedActionId: "hosts-view",
-    targetSystem: "CLIENT-PC",
+    target: "CLIENT-PC",
     methodOrTool: "type",
     requestedAction: "view hosts",
     parameters: {},
@@ -166,12 +167,13 @@ describe("candidate data leakage route coverage (integration)", () => {
     vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.candidate));
     vi.mocked(classifyCandidateIntent).mockResolvedValue({
       decision: "INCOMPLETE_ACTION",
+      targetType: null,
       matchedActionId: "hosts-view",
-      targetSystem: null,
+      target: null,
       methodOrTool: null,
       requestedAction: "check hosts",
       parameters: {},
-      missingFields: ["targetSystem"],
+      missingFields: ["target"],
       reasoning: "SECRET_ROOT_CAUSE_OrgA SECRET_AI_INSTRUCTIONS_OrgA",
     });
     const attemptId = await startAttempt(seeded.assignment.id);
@@ -212,7 +214,7 @@ describe("candidate data leakage route coverage (integration)", () => {
       result: "APPROVED_DIALOGUE_FACT_OrgA: Selina says only her PC is affected.",
       category: "communication",
       requirements: {
-        requireTargetSystem: true,
+        requireTarget: true,
         requireMethodOrTool: true,
         requiredParameters: [],
         allowedTargets: ["Selina"],
@@ -229,7 +231,7 @@ describe("candidate data leakage route coverage (integration)", () => {
     vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.candidate));
     vi.mocked(classifyCandidateIntent).mockResolvedValue(validHostsClassification({
       matchedActionId: "call-user",
-      targetSystem: "Selina",
+      target: "Selina",
       methodOrTool: "call",
       requestedAction: "call user",
     }));

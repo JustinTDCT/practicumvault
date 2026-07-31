@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { actionTargetTypeSchema } from "@/lib/templates/schema";
 
 export const classificationDecisionSchema = z.enum([
   "VALID_ACTION",
@@ -17,7 +18,8 @@ export type ClassificationDecision = z.infer<typeof classificationDecisionSchema
 /** Schema for generateObject — no z.record(), no .default(), all fields required. */
 export const classifierGenerationSchema = z.object({
   decision: classificationDecisionSchema,
-  targetSystem: z.string().nullable(),
+  targetType: actionTargetTypeSchema.nullable(),
+  target: z.string().nullable(),
   methodOrTool: z.string().nullable(),
   requestedAction: z.string().nullable(),
   parameters: z.array(
@@ -36,7 +38,8 @@ export type ClassifierGeneration = z.infer<typeof classifierGenerationSchema>;
 /** Normalized app-facing classification (parameters as a string map). */
 export const intentClassificationSchema = z.object({
   decision: classificationDecisionSchema,
-  targetSystem: z.string().nullable(),
+  targetType: actionTargetTypeSchema.nullable(),
+  target: z.string().nullable(),
   methodOrTool: z.string().nullable(),
   requestedAction: z.string().nullable(),
   parameters: z.record(z.string()),
@@ -61,7 +64,8 @@ export type TurnResponseType =
 export interface TurnStructuredRecord {
   candidateMessageId: string;
   classificationDecision: ClassificationDecision;
-  targetSystem: string | null;
+  targetType: z.infer<typeof actionTargetTypeSchema> | null;
+  target: string | null;
   methodOrTool: string | null;
   requestedAction: string | null;
   parameters: Record<string, string>;

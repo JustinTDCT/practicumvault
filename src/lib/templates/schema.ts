@@ -21,8 +21,21 @@ export const hintSchema = z.object({
   penalty: z.number().min(0).max(100),
 });
 
-export const actionRequirementSchema = z.object({
-  requireTargetSystem: z.boolean().default(false),
+export const actionTargetTypeSchema = z.enum([
+  "system",
+  "person",
+  "account",
+  "file",
+  "service",
+  "none",
+]);
+
+export type ActionTargetType = z.infer<typeof actionTargetTypeSchema>;
+
+const actionRequirementObjectSchema = z.object({
+  /** What kind of target the candidate must name for this action. */
+  targetType: actionTargetTypeSchema.optional(),
+  requireTarget: z.boolean().default(false),
   requireMethodOrTool: z.boolean().default(false),
   requiredParameters: z.array(z.string()).default([]),
   allowedTargets: z.array(z.string()).default([]),
@@ -33,14 +46,36 @@ export const actionRequirementSchema = z.object({
   requirementsReviewed: z.boolean().default(false),
 });
 
+/** Maps legacy requireTargetSystem onto requireTarget. */
+export const actionRequirementSchema = z.preprocess((raw) => {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const r = { ...(raw as Record<string, unknown>) };
+  if (r.requireTarget === undefined && typeof r.requireTargetSystem === "boolean") {
+    r.requireTarget = r.requireTargetSystem;
+  }
+  delete r.requireTargetSystem;
+  return r;
+}, actionRequirementObjectSchema);
+
+export type ActionRequirements = z.infer<typeof actionRequirementObjectSchema>;
+
+export const actionCategorySchema = z.enum([
+  "diagnostic",
+  "communication",
+  "remediation",
+  "validation",
+]);
+
+export type ActionCategory = z.infer<typeof actionCategorySchema>;
+
 export const actionSchema = z.object({
   id: z.string().min(1),
   label: z.string().min(1),
   triggers: z.array(z.string()).default([]),
   result: z.string().min(1),
-  category: z.enum(["diagnostic", "communication", "remediation", "validation"]).default("diagnostic"),
+  category: actionCategorySchema.default("diagnostic"),
   requirements: actionRequirementSchema.default({
-    requireTargetSystem: false,
+    requireTarget: false,
     requireMethodOrTool: false,
     requiredParameters: [],
     allowedTargets: [],
@@ -112,9 +147,24 @@ export function validateTemplateContent(content: unknown): ScenarioTemplateConte
   return scenarioTemplateContentSchema.parse(content) as ScenarioTemplateContent;
 }
 
-export function getDefaultActionRequirements(partial?: Partial<z.infer<typeof actionRequirementSchema>>) {
+export function defaultTargetTypeForCategory(category: ActionCategory): ActionTargetType {
+  return category === "communication" ? "person" : "system";
+}
+
+export function resolveActionTargetType(action: ActionDefinition): ActionTargetType {
+  const req = action.requirements;
+  if (req?.targetType) return req.targetType;
+  return defaultTargetTypeForCategory(action.category);
+}
+
+export function getDefaultActionRequirements(
+  partial?: Partial<ActionRequirements>,
+  options?: { category?: ActionCategory },
+): ActionRequirements {
+  const category = options?.category ?? "diagnostic";
   return {
-    requireTargetSystem: false,
+    targetType: defaultTargetTypeForCategory(category),
+    requireTarget: false,
     requireMethodOrTool: false,
     requiredParameters: [] as string[],
     allowedTargets: [] as string[],
@@ -129,7 +179,8 @@ export function getDefaultActionRequirements(partial?: Partial<z.infer<typeof ac
 export function getActionSpecificityIssues(content: ScenarioTemplateContent): string[] {
   const issues: string[] = [];
   for (const action of content.actions) {
-    const req = action.requirements ?? getDefaultActionRequirements();
+    const req = action.requirements ?? getDefaultActionRequirements(undefined, { category: action.category });
+    const targetType = resolveActionTargetType(action);
     if (!req.requirementsReviewed) {
       issues.push(`Action "${action.label || action.id}" has not had its specificity requirements reviewed.`);
       continue;
@@ -141,14 +192,19 @@ export function getActionSpecificityIssues(content: ScenarioTemplateContent): st
       action.category === "remediation" ||
       action.category === "validation"
     ) {
-      if (!req.requireTargetSystem && !req.requireMethodOrTool && req.requiredParameters.length === 0) {
+      if (!req.requireTarget && !req.requireMethodOrTool && req.requiredParameters.length === 0) {
         issues.push(
           `Action "${action.label || action.id}" (${action.category}) needs target/tool/parameter requirements, or mark it intentionally unrestricted.`,
         );
       }
     }
     if (action.category === "communication") {
-      if (!req.requireTargetSystem && req.allowedTargets.length === 0) {
+      if (targetType !== "person" && targetType !== "none") {
+        issues.push(
+          `Communication action "${action.label || action.id}" should use target type "person" (who is being contacted).`,
+        );
+      }
+      if (!req.requireTarget && req.allowedTargets.length === 0) {
         issues.push(
           `Communication action "${action.label || action.id}" should require or list who is being contacted.`,
         );

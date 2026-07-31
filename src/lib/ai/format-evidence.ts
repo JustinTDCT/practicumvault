@@ -23,43 +23,43 @@ export function inferEvidenceFormat(category: string, label: string): EvidenceFo
   return "raw";
 }
 
-export function formatCommandEvidence(evidence: string, targetSystem: string | null): string {
-  const label = targetSystem ? `**From ${targetSystem}:**` : "**Command output:**";
+export function formatCommandEvidence(evidence: string, target: string | null): string {
+  const label = target ? `**From ${target}:**` : "**Command output:**";
   const body = evidence.trim().startsWith("```") ? evidence.trim() : `\`\`\`\n${evidence.trim()}\n\`\`\``;
   return `${label}\n\n${body}`;
 }
 
-export function formatLogEvidence(evidence: string, targetSystem: string | null): string {
-  const label = targetSystem ? `**Event log — ${targetSystem}:**` : "**Event log:**";
+export function formatLogEvidence(evidence: string, target: string | null): string {
+  const label = target ? `**Event log — ${target}:**` : "**Event log:**";
   const body = evidence.trim().startsWith("```") ? evidence.trim() : `\`\`\`\n${evidence.trim()}\n\`\`\``;
   return `${label}\n\n${body}`;
 }
 
-export function formatFileEvidence(evidence: string, targetSystem: string | null): string {
-  const label = targetSystem ? `**File contents — ${targetSystem}:**` : "**File contents:**";
+export function formatFileEvidence(evidence: string, target: string | null): string {
+  const label = target ? `**File contents — ${target}:**` : "**File contents:**";
   const body = evidence.trim().startsWith("```") ? evidence.trim() : `\`\`\`\n${evidence.trim()}\n\`\`\``;
   return `${label}\n\n${body}`;
 }
 
-export function formatConsoleEvidence(evidence: string, targetSystem: string | null): string {
-  const label = targetSystem ? `**${targetSystem}:**` : "**Console:**";
+export function formatConsoleEvidence(evidence: string, target: string | null): string {
+  const label = target ? `**${target}:**` : "**Console:**";
   return `${label}\n\n${evidence.trim()}`;
 }
 
 export function formatDeterministicEvidence(
   evidence: string,
   format: EvidenceFormat,
-  targetSystem: string | null,
+  target: string | null,
 ): string {
   switch (format) {
     case "command":
-      return formatCommandEvidence(evidence, targetSystem);
+      return formatCommandEvidence(evidence, target);
     case "log":
-      return formatLogEvidence(evidence, targetSystem);
+      return formatLogEvidence(evidence, target);
     case "file":
-      return formatFileEvidence(evidence, targetSystem);
+      return formatFileEvidence(evidence, target);
     case "console":
-      return formatConsoleEvidence(evidence, targetSystem);
+      return formatConsoleEvidence(evidence, target);
     case "dialogue":
     case "raw":
     default:

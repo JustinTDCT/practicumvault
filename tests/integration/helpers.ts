@@ -100,7 +100,7 @@ export async function seedOrg(name: string) {
       result: `SECRET_ACTION_RESULT_${name}`,
       category: "diagnostic",
       requirements: {
-        requireTargetSystem: true,
+        requireTarget: true,
         requireMethodOrTool: true,
         requiredParameters: [],
         allowedTargets: ["CLIENT-PC"],
@@ -116,7 +116,7 @@ export async function seedOrg(name: string) {
       result: `SECRET_UNREVEALED_ACTION_RESULT_${name}`,
       category: "diagnostic",
       requirements: {
-        requireTargetSystem: true,
+        requireTarget: true,
         requireMethodOrTool: true,
         requiredParameters: [],
         allowedTargets: ["ADMIN-PC"],

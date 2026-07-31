@@ -163,7 +163,8 @@ describe("failed turn recovery (integration)", () => {
     vi.mocked(requireAuth).mockResolvedValue(asSession(seeded.candidate));
     vi.mocked(classifyCandidateIntent).mockResolvedValue({
       decision: "REFERENCE_QUESTION",
-      targetSystem: null,
+      targetType: null,
+      target: null,
       methodOrTool: null,
       requestedAction: "What does Event ID 4776 mean?",
       parameters: {},

@@ -71,16 +71,53 @@ describe("candidate intent classification", () => {
   it("returns neutral clarification derived from missing fields", () => {
     const question = deriveClarificationQuestion({
       decision: "INCOMPLETE_ACTION",
-      targetSystem: null,
+      targetType: null,
+      target: null,
       methodOrTool: null,
       requestedAction: "check dns",
       parameters: {},
       matchedActionId: null,
-      missingFields: ["targetSystem"],
+      missingFields: ["target"],
       reasoning: "test",
     });
     expect(question).toBe("Which system do you want to run that on?");
     expect(question).not.toMatch(/should|try|next|suggest/i);
+  });
+
+  it("asks who to contact when the missing target is a person", () => {
+    const question = deriveClarificationQuestion(
+      {
+        decision: "INCOMPLETE_ACTION",
+        targetType: "person",
+        target: null,
+        methodOrTool: "ask",
+        requestedAction: "ask for summary",
+        parameters: {},
+        matchedActionId: null,
+        missingFields: ["target"],
+        reasoning: "test",
+      },
+      { candidateMessage: "client and ask for summary in her own words" },
+    );
+    expect(question).toBe("Who do you want to contact?");
+  });
+
+  it("infers person clarification from contact-like candidate text", () => {
+    const question = deriveClarificationQuestion(
+      {
+        decision: "INCOMPLETE_ACTION",
+        targetType: null,
+        target: null,
+        methodOrTool: null,
+        requestedAction: null,
+        parameters: {},
+        matchedActionId: null,
+        missingFields: ["target", "methodOrTool", "requestedAction"],
+        reasoning: "test",
+      },
+      { candidateMessage: "client and ask for summary in her own words" },
+    );
+    expect(question).toBe("Who do you want to contact?");
   });
 
   it("uses neutral delegation refusal text", () => {
@@ -131,7 +168,8 @@ describe("classifier structured output", () => {
   it("requires explicit parameter arrays with no schema defaults", () => {
     const parsed = classifierGenerationSchema.parse({
       decision: "VALID_ACTION",
-      targetSystem: "CLIENT-PC",
+      targetType: null,
+      target: "CLIENT-PC",
       methodOrTool: "ping",
       requestedAction: "ping coolsite",
       parameters: [{ name: "host", value: "www.coolsite.com" }],
@@ -143,7 +181,8 @@ describe("classifier structured output", () => {
     expect(() =>
       classifierGenerationSchema.parse({
         decision: "VALID_ACTION",
-        targetSystem: null,
+        targetType: null,
+        target: null,
         methodOrTool: null,
         requestedAction: null,
         matchedActionId: null,
@@ -155,7 +194,8 @@ describe("classifier structured output", () => {
   it("normalizes parameter arrays into a string map", () => {
     const normalized = normalizeClassifierOutput({
       decision: "VALID_ACTION",
-      targetSystem: "CLIENT-PC",
+      targetType: null,
+      target: "CLIENT-PC",
       methodOrTool: "ping",
       requestedAction: "ping coolsite",
       parameters: [
@@ -214,7 +254,8 @@ describe("classifier structured output", () => {
     generateObjectMock.mockResolvedValue({
       object: {
         decision: "INCOMPLETE_ACTION",
-        targetSystem: null,
+        targetType: null,
+        target: null,
         methodOrTool: null,
         requestedAction: "check dns",
         parameters: [],

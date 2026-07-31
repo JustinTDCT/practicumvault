@@ -411,10 +411,20 @@ export default function TemplateEditorPage() {
                 <select
                   value={action.category}
                   onChange={(e) => {
+                    const category = e.target.value as typeof action.category;
                     const actions = [...content.actions];
                     actions[i] = {
                       ...action,
-                      category: e.target.value as typeof action.category,
+                      category,
+                      requirements: {
+                        ...req,
+                        targetType:
+                          category === "communication"
+                            ? "person"
+                            : req.targetType === "person"
+                              ? "system"
+                              : (req.targetType ?? "system"),
+                      },
                     };
                     setContent({ ...content, actions });
                   }}
@@ -445,19 +455,45 @@ export default function TemplateEditorPage() {
                   These rules decide when the simulation may reveal this action’s result. Leave a box
                   unchecked only when that detail is not needed, then mark the action reviewed.
                 </p>
+                <label style={{ display: "block", marginBottom: 8, fontSize: 13 }}>
+                  Target type
+                  <select
+                    value={req.targetType ?? (action.category === "communication" ? "person" : "system")}
+                    disabled={status === "DISABLED" || req.intentionallyUnrestricted}
+                    onChange={(e) =>
+                      updateRequirements({
+                        targetType: e.target.value as NonNullable<typeof req.targetType>,
+                      })
+                    }
+                    style={{ display: "block", width: "100%", marginTop: 4 }}
+                  >
+                    <option value="system">System (computer / server)</option>
+                    <option value="person">Person (who is contacted)</option>
+                    <option value="account">Account</option>
+                    <option value="file">File</option>
+                    <option value="service">Service</option>
+                    <option value="none">None</option>
+                  </select>
+                </label>
                 <label style={{ display: "flex", gap: 8, alignItems: "flex-start", marginBottom: 8, fontSize: 14 }}>
                   <input
                     type="checkbox"
-                    checked={req.requireTargetSystem}
-                    disabled={status === "DISABLED" || req.intentionallyUnrestricted}
-                    onChange={(e) => updateRequirements({ requireTargetSystem: e.target.checked })}
+                    checked={req.requireTarget}
+                    disabled={
+                      status === "DISABLED" ||
+                      req.intentionallyUnrestricted ||
+                      (req.targetType ?? "system") === "none"
+                    }
+                    onChange={(e) => updateRequirements({ requireTarget: e.target.checked })}
                   />
                   <span>
-                    <strong>Require target system</strong>
+                    <strong>Require target</strong>
                     <br />
                     <span style={{ color: "var(--text-muted)", fontSize: 13 }}>
-                      Candidate must name which computer, server, or account they are checking
-                      (for example CLIENT-PC).
+                      {(req.targetType ?? (action.category === "communication" ? "person" : "system")) ===
+                      "person"
+                        ? "Candidate must name who they are contacting (for example Selina Kyle)."
+                        : "Candidate must name the system, account, file, or service they are acting on."}
                     </span>
                   </span>
                 </label>
@@ -543,7 +579,7 @@ export default function TemplateEditorPage() {
                         intentionallyUnrestricted: e.target.checked,
                         ...(e.target.checked
                           ? {
-                              requireTargetSystem: false,
+                              requireTarget: false,
                               requireMethodOrTool: false,
                               requiredParameters: [],
                               allowedTargets: [],
@@ -597,7 +633,7 @@ export default function TemplateEditorPage() {
                       result: "",
                       category: "diagnostic",
                       requirements: getDefaultActionRequirements({
-                        requireTargetSystem: true,
+                        requireTarget: true,
                         requireMethodOrTool: true,
                       }),
                     },
