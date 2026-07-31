@@ -1,4 +1,5 @@
 import { Attempt, AttemptMessage, ScenarioVersion, ScenarioTemplate, User } from "@prisma/client";
+import { parseScenarioSnapshot } from "@/lib/attempts/snapshot";
 
 type AttemptForTranscript = Attempt & {
   candidate: User;
@@ -14,6 +15,21 @@ function slugify(value: string): string {
     .slice(0, 60);
 }
 
+function snapshotMeta(attempt: AttemptForTranscript) {
+  if (attempt.scenarioSnapshot) {
+    try {
+      const snap = parseScenarioSnapshot(attempt.scenarioSnapshot);
+      return { title: snap.templateTitle, version: snap.versionDisplay };
+    } catch {
+      // fall through
+    }
+  }
+  return {
+    title: attempt.scenarioVersion.template.title,
+    version: attempt.scenarioVersion.version,
+  };
+}
+
 export function buildTranscriptFilename(attempt: AttemptForTranscript): string {
   const candidate = slugify(attempt.candidate.fullName || "candidate");
   const scenario = slugify(attempt.scenarioVersion.template.slug || "scenario");
@@ -21,18 +37,22 @@ export function buildTranscriptFilename(attempt: AttemptForTranscript): string {
 }
 
 export function formatAttemptTranscript(attempt: AttemptForTranscript): string {
+  const meta = snapshotMeta(attempt);
   const lines: string[] = [
     "Practicum Vault — Assessment Transcript",
     "=".repeat(48),
     "",
     `Candidate: ${attempt.candidate.fullName}`,
     `Email: ${attempt.candidate.email}`,
-    `Scenario: ${attempt.scenarioVersion.template.title} (v${attempt.scenarioVersion.version})`,
+    `Scenario: ${meta.title} (v${meta.version})`,
     `Status: ${attempt.status}`,
     `Started: ${attempt.startedAt.toLocaleString()}`,
+    `Submitted: ${attempt.submittedAt?.toLocaleString() ?? "—"}`,
     `Completed: ${attempt.completedAt?.toLocaleString() ?? "—"}`,
     `Score: ${attempt.overallScore ?? "—"}/100`,
     `Hints used: ${attempt.hintsUsed}`,
+    `Scoring model: ${attempt.scoringModel ?? "—"}`,
+    `Scoring engine: ${attempt.scoringEngineVersion ?? "—"}`,
     "",
     "-".repeat(48),
     "Transcript",

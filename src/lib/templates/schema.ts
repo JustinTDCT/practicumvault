@@ -21,12 +21,27 @@ export const hintSchema = z.object({
   penalty: z.number().min(0).max(100),
 });
 
+export const actionRequirementSchema = z.object({
+  requireTargetSystem: z.boolean().default(false),
+  requireMethodOrTool: z.boolean().default(false),
+  requiredParameters: z.array(z.string()).default([]),
+  allowedTargets: z.array(z.string()).default([]),
+  allowedMethods: z.array(z.string()).default([]),
+});
+
 export const actionSchema = z.object({
   id: z.string().min(1),
   label: z.string().min(1),
   triggers: z.array(z.string()).default([]),
   result: z.string().min(1),
   category: z.enum(["diagnostic", "communication", "remediation", "validation"]).default("diagnostic"),
+  requirements: actionRequirementSchema.default({
+    requireTargetSystem: false,
+    requireMethodOrTool: false,
+    requiredParameters: [],
+    allowedTargets: [],
+    allowedMethods: [],
+  }),
 });
 
 export const objectiveSchema = z.object({

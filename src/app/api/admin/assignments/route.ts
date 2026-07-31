@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
 import { prisma } from "@/lib/db";
-import { getLatestPublishedVersion, allowAssignmentRetake } from "@/lib/attempts/service";
+import { allowAssignmentRetake } from "@/lib/attempts/service";
+import { verifyOrgCandidate, verifyOrgPosition, verifyOrgTemplate, OrgAccessError } from "@/lib/org/verify";
 import { UserRole, AssignmentStatus, TemplateStatus } from "@prisma/client";
 
 export async function GET() {
@@ -33,8 +34,28 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Candidate and template required" }, { status: 400 });
   }
 
-  const version = await getLatestPublishedVersion(templateId);
-  if (!version || version.status !== TemplateStatus.PUBLISHED) {
+  try {
+    await verifyOrgCandidate(candidateId, session.organizationId);
+    await verifyOrgTemplate(templateId, session.organizationId);
+    if (positionId) {
+      await verifyOrgPosition(positionId, session.organizationId);
+    }
+  } catch (err) {
+    if (err instanceof OrgAccessError) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+    throw err;
+  }
+
+  const version = await prisma.scenarioVersion.findFirst({
+    where: {
+      templateId,
+      status: TemplateStatus.PUBLISHED,
+      template: { organizationId: session.organizationId },
+    },
+    orderBy: { publishedAt: "desc" },
+  });
+  if (!version) {
     return NextResponse.json({ error: "No published version available for this template" }, { status: 400 });
   }
 

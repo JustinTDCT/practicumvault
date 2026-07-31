@@ -29,7 +29,20 @@ export async function PATCH(
     if (body.enabled === false) invalidateSessions = true;
   }
   if (body.notes !== undefined) data.notes = body.notes;
-  if (body.positionId !== undefined) data.positionId = body.positionId || null;
+  if (body.positionId !== undefined) {
+    if (body.positionId) {
+      const position = await prisma.position.findFirst({
+        where: { id: body.positionId, organizationId: session.organizationId },
+        select: { id: true },
+      });
+      if (!position) {
+        return NextResponse.json({ error: "Not found" }, { status: 404 });
+      }
+      data.positionId = body.positionId;
+    } else {
+      data.positionId = null;
+    }
+  }
   if (body.role !== undefined && body.role !== existing.role) {
     data.role = body.role;
     invalidateSessions = true;

@@ -7,9 +7,9 @@ interface Assignment {
   id: string;
   status: string;
   canStart: boolean;
-  scenarioVersion: {
-    template: { title: string };
-    version: string;
+  scenario: {
+    title: string;
+    displayedVersion: string;
     timeLimitMinutes: number;
   };
 }
@@ -107,9 +107,9 @@ export default function CandidateDashboard() {
             {assignments.map((a) => (
               <div key={a.id} className="card list-card">
                 <div>
-                  <h3 className="list-card-title">{a.scenarioVersion.template.title}</h3>
+                  <h3 className="list-card-title">{a.scenario.title}</h3>
                   <p className="list-card-meta">
-                    Version {a.scenarioVersion.version} · {a.scenarioVersion.timeLimitMinutes} min
+                    Version {a.scenario.displayedVersion} · {a.scenario.timeLimitMinutes} min
                   </p>
                   <span className={statusBadgeClass(a.status)} style={{ marginTop: 8, display: "inline-block" }}>
                     {statusLabel(a.status)}

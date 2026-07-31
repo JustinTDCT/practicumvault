@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "fix/**"]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: practicum
+          POSTGRES_PASSWORD: practicum_test
+          POSTGRES_DB: practicum_vault_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U practicum -d practicum_vault_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://practicum:practicum_test@localhost:5432/practicum_vault_test?schema=public
+      DATABASE_URL_TEST: postgresql://practicum:practicum_test@localhost:5432/practicum_vault_test?schema=public
+      SESSION_SECRET: ci-session-secret-at-least-32-characters-long
+      ENCRYPTION_KEY: a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0fedcba9876543210
+      NODE_ENV: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Prisma generate
+        run: npx prisma generate
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm run test
+
+      - name: Migrate test database
+        run: npx prisma migrate deploy
+
+      - name: Integration tests
+        run: npm run test:integration
+
+      - name: Build
+        run: npm run build

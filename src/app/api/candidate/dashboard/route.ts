@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { requireAuth } from "@/lib/auth";
 import { prisma } from "@/lib/db";
 import { getActiveAttemptForCandidate, canCandidateStartAssignment } from "@/lib/attempts/service";
+import { CandidateDashboardDto } from "@/lib/dto/candidate";
 import { UserRole } from "@prisma/client";
 
 export async function GET() {
@@ -11,19 +12,37 @@ export async function GET() {
   const [assignments, activeAttempt] = await Promise.all([
     prisma.assignment.findMany({
       where: { candidateId: session.userId },
-      include: {
-        scenarioVersion: { include: { template: true } },
+      select: {
+        id: true,
+        status: true,
+        scenarioVersion: {
+          select: {
+            version: true,
+            timeLimitMinutes: true,
+            template: {
+              select: { title: true },
+            },
+          },
+        },
       },
       orderBy: { createdAt: "desc" },
     }),
     getActiveAttemptForCandidate(session.userId),
   ]);
 
-  return NextResponse.json({
+  const response: CandidateDashboardDto = {
     assignments: assignments.map((a) => ({
-      ...a,
+      id: a.id,
+      status: a.status,
       canStart: canCandidateStartAssignment(a.status),
+      scenario: {
+        title: a.scenarioVersion.template.title,
+        displayedVersion: a.scenarioVersion.version,
+        timeLimitMinutes: a.scenarioVersion.timeLimitMinutes,
+      },
     })),
     activeAttempt: activeAttempt ? { id: activeAttempt.id } : null,
-  });
+  };
+
+  return NextResponse.json(response);
 }

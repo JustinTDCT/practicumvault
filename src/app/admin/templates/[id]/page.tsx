@@ -391,7 +391,20 @@ export default function TemplateEditorPage() {
                   ...content,
                   actions: [
                     ...content.actions,
-                    { id: `action-${content.actions.length + 1}`, label: "", triggers: [], result: "", category: "diagnostic" },
+                    {
+                      id: `action-${content.actions.length + 1}`,
+                      label: "",
+                      triggers: [],
+                      result: "",
+                      category: "diagnostic",
+                      requirements: {
+                        requireTargetSystem: false,
+                        requireMethodOrTool: false,
+                        requiredParameters: [],
+                        allowedTargets: [],
+                        allowedMethods: [],
+                      },
+                    },
                   ],
                 })
               }

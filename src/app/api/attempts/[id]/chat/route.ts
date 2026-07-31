@@ -1,18 +1,26 @@
+import { streamText } from "ai";
 import { NextRequest } from "next/server";
 import { requireAuth } from "@/lib/auth";
 import { prisma } from "@/lib/db";
-import { getLanguageModel, providerLabel } from "@/lib/ai/provider";
+import { formatModelLabel, getLanguageModelForAttempt } from "@/lib/ai/provider";
+import { classifyCandidateIntent } from "@/lib/ai/classifier";
 import {
-  classifyCandidateIntent,
+  ANSWER_SEEKING_REFUSAL,
+  DELEGATION_REFUSAL,
+  PROMPT_ATTACK_REFUSAL,
 } from "@/lib/ai/classifier";
 import {
   buildStaticResponse,
   formatReferenceResponse,
-  lookupScenarioAction,
   resolveResponseType,
   selectEvidenceForAction,
-  streamFormattedResponse,
 } from "@/lib/ai/simulation";
+import { validateClassifiedAction } from "@/lib/ai/validate-action";
+import {
+  formatDeterministicEvidence,
+  inferEvidenceFormat,
+  validateDialogueOutput,
+} from "@/lib/ai/format-evidence";
 import { TurnStructuredRecord } from "@/lib/ai/types";
 import { createPolicyViolationStreamResponse } from "@/lib/ai/cheat-detection";
 import {
@@ -25,17 +33,94 @@ import {
 } from "@/lib/attempts/service";
 import { detectUnsafeActionDeterministic } from "@/lib/scoring/unsafe-actions";
 import { evaluateCurrentObjective, submitAttempt } from "@/lib/scoring/engine";
-import { LIMITS } from "@/lib/config/limits";
-import { UserRole } from "@prisma/client";
+import { LIMITS, POLICY_VIOLATION_PENALTY } from "@/lib/config/limits";
+import { AttemptStatus, UserRole } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 
-function checkRateLimit(
-  timestamps: number[],
-  windowMs: number,
-  max: number,
-): boolean {
+type ChatAttempt = Prisma.AttemptGetPayload<{
+  include: {
+    messages: true;
+    scenarioVersion: { include: { template: true } };
+    organization: true;
+  };
+}>;
+
+async function loadChatAttempt(attemptId: string, candidateId: string): Promise<ChatAttempt | null> {
+  return prisma.attempt.findFirst({
+    where: { id: attemptId, candidateId },
+    include: {
+      messages: { orderBy: { createdAt: "asc" } },
+      scenarioVersion: { include: { template: true } },
+      organization: true,
+    },
+  });
+}
+
+function checkRateLimit(timestamps: number[], windowMs: number, max: number): boolean {
   const now = Date.now();
   const recent = timestamps.filter((t) => now - t < windowMs);
   return recent.length < max;
+}
+
+async function persistAssistantOnce(
+  attemptId: string,
+  content: string,
+  metadata?: Record<string, unknown>,
+): Promise<void> {
+  const trimmed = content.trim();
+  if (!trimmed) return;
+
+  const recent = await prisma.attemptMessage.findFirst({
+    where: { attemptId, role: "assistant" },
+    orderBy: { createdAt: "desc" },
+  });
+  if (recent && recent.content === trimmed && Date.now() - recent.createdAt.getTime() < 5000) {
+    return;
+  }
+
+  await prisma.attemptMessage.create({
+    data: {
+      attemptId,
+      role: "assistant",
+      content: trimmed,
+      metadata: (metadata as object | undefined) ?? undefined,
+    },
+  });
+}
+
+async function recordPolicyViolationIfNeeded(
+  attemptId: string,
+  candidateMessageId: string,
+  decision: string,
+): Promise<void> {
+  if (
+    decision !== "DELEGATION_REQUEST" &&
+    decision !== "ANSWER_SEEKING" &&
+    decision !== "META_OR_PROMPT_ATTACK"
+  ) {
+    return;
+  }
+
+  const existing = await prisma.attemptEvent.findFirst({
+    where: {
+      attemptId,
+      type: "policy_violation",
+      payload: { path: ["candidateMessageId"], equals: candidateMessageId },
+    },
+  });
+  if (existing) return;
+
+  await prisma.attemptEvent.create({
+    data: {
+      attemptId,
+      type: "policy_violation",
+      payload: {
+        candidateMessageId,
+        category: decision,
+        penalty: POLICY_VIOLATION_PENALTY,
+      },
+    },
+  });
 }
 
 export async function POST(
@@ -51,29 +136,26 @@ export async function POST(
   const body = await request.json();
   const { message, action } = body as { message?: string; action?: string };
 
-  let attempt = await prisma.attempt.findUnique({
-    where: { id: attemptId },
-    include: {
-      messages: { orderBy: { createdAt: "asc" } },
-      scenarioVersion: { include: { template: true } },
-      organization: true,
-    },
-  });
+  await expireAttemptIfNeeded(attemptId);
 
-  if (!attempt || attempt.candidateId !== session.userId) {
+  const attempt = await loadChatAttempt(attemptId, session.userId);
+  if (!attempt) {
     return new Response("Not found", { status: 404 });
   }
 
-  const expired = await expireAttemptIfNeeded(attemptId);
-  if (!expired || !isAttemptAcceptingMessages(expired.status)) {
+  if (!isAttemptAcceptingMessages(attempt.status)) {
     return new Response("Session is no longer active", { status: 400 });
   }
 
-  attempt = expired as typeof attempt;
+  if (!attempt.organization) {
+    return Response.json({ error: "Organization configuration unavailable" }, { status: 500 });
+  }
+
   const content = getAttemptScenarioContent(attempt);
-  const snapshot = attempt.scenarioSnapshot
-    ? getSnapshotFromAttempt(attempt)
-    : null;
+  if (!attempt.scenarioSnapshot) {
+    return Response.json({ error: "Attempt snapshot missing" }, { status: 500 });
+  }
+  const snapshot = getSnapshotFromAttempt(attempt);
 
   if (action === "complete") {
     try {
@@ -95,11 +177,8 @@ export async function POST(
       return Response.json({ error: "Objective check limit reached" }, { status: 429 });
     }
 
-    const objectiveStates = await evaluateCurrentObjective(attemptId);
-    const allPassed = content.objectives.every((o) =>
-      objectiveStates.find((s) => s.objectiveId === o.id)?.passed,
-    );
-    return Response.json({ objectiveStates, gateStates: objectiveStates, allPassed, allCompleted: allPassed });
+    await evaluateCurrentObjective(attemptId);
+    return Response.json({ evaluated: true });
   }
 
   if (action === "hint") {
@@ -113,36 +192,50 @@ export async function POST(
       return Response.json({ error: "No more hints available" }, { status: 400 });
     }
 
-    const updated = await prisma.$transaction(async (tx) => {
-      const current = await tx.attempt.findUnique({ where: { id: attemptId } });
-      if (!current || current.hintsUsed !== hintIndex) {
-        throw new Error("Hint already issued");
-      }
-      return tx.attempt.update({
-        where: { id: attemptId, hintsUsed: hintIndex },
-        data: {
-          hintsUsed: hintIndex + 1,
-          hintsPenalty: current.hintsPenalty + hint.penalty,
-        },
-      });
-    });
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        const current = await tx.attempt.findFirst({
+          where: { id: attemptId, status: AttemptStatus.IN_PROGRESS, hintsUsed: hintIndex },
+        });
+        if (!current) {
+          throw new Error("HINT_ALREADY_ISSUED");
+        }
 
-    await prisma.attemptMessage.create({
-      data: {
-        attemptId,
-        role: "assistant",
-        content: `**Hint (Level ${hint.level})**\n\n${hint.text}`,
-        metadata: { type: "hint", level: hint.level, penalty: hint.penalty },
-      },
-    });
-    await prisma.attemptEvent.create({
-      data: {
-        attemptId,
-        type: "hint_requested",
-        payload: { level: hint.level, penalty: hint.penalty },
-      },
-    });
-    return Response.json({ hint: hint.text, penalty: hint.penalty, hintsUsed: updated.hintsUsed });
+        const updated = await tx.attempt.update({
+          where: { id: attemptId },
+          data: {
+            hintsUsed: hintIndex + 1,
+            hintsPenalty: current.hintsPenalty + hint.penalty,
+          },
+        });
+
+        await tx.attemptMessage.create({
+          data: {
+            attemptId,
+            role: "assistant",
+            content: `**Hint (Level ${hint.level})**\n\n${hint.text}`,
+            metadata: { type: "hint", level: hint.level, penalty: hint.penalty },
+          },
+        });
+
+        await tx.attemptEvent.create({
+          data: {
+            attemptId,
+            type: "hint_requested",
+            payload: { level: hint.level, penalty: hint.penalty, hintIndex },
+          },
+        });
+
+        return updated;
+      });
+
+      return Response.json({ hint: hint.text, penalty: hint.penalty, hintsUsed: result.hintsUsed });
+    } catch (err) {
+      if (err instanceof Error && err.message === "HINT_ALREADY_ISSUED") {
+        return Response.json({ error: "Hint already issued" }, { status: 409 });
+      }
+      throw err;
+    }
   }
 
   if (!message?.trim()) {
@@ -181,10 +274,11 @@ export async function POST(
     data: { messageCount: { increment: 1 } },
   });
 
-  const model = getLanguageModel(attempt.organization);
-  const modelLabel = snapshot
-    ? `${providerLabel(snapshot.modelProvider)}/${snapshot.modelName}`
-    : providerLabel(attempt.organization.llmProvider);
+  const { model, provider, modelName } = getLanguageModelForAttempt({
+    snapshot,
+    organization: attempt.organization,
+  });
+  const modelLabel = formatModelLabel(provider, modelName);
 
   const existingUnsafe = parseUnsafeActionRecords(attempt.unsafeActionRecords);
   const unsafeRecord = await detectUnsafeActionDeterministic(
@@ -199,7 +293,10 @@ export async function POST(
       where: { id: attemptId },
       data: {
         unsafeActionRecords: [...existingUnsafe, unsafeRecord] as object,
-        unsafeActions: [...(Array.isArray(attempt.unsafeActions) ? attempt.unsafeActions as string[] : []), unsafeRecord.description],
+        unsafeActions: [
+          ...(Array.isArray(attempt.unsafeActions) ? (attempt.unsafeActions as string[]) : []),
+          unsafeRecord.description,
+        ],
         modelCallsCount: { increment: 1 },
       },
     });
@@ -212,47 +309,120 @@ export async function POST(
     });
   }
 
-  const classification = await classifyCandidateIntent(model, content, message.trim());
-  const responseType = resolveResponseType(classification);
+  const rawClassification = await classifyCandidateIntent(model, content, message.trim());
+  const validated = validateClassifiedAction(content, rawClassification, message.trim());
+  const classification = validated.classification;
+  const responseType = resolveResponseType({ ...classification, decision: validated.decision });
+
   let evidenceIds: string[] = [];
   let responseText: string | null = null;
-  let streamResponse: Response | null = null;
 
-  if (classification.decision === "VALID_ACTION") {
-    const actionId = classification.matchedActionId;
-    const matched = actionId ? lookupScenarioAction(content, actionId) : null;
+  if (validated.decision === "VALID_ACTION" && validated.approvedActionId) {
+    const matched = content.actions.find((a) => a.id === validated.approvedActionId)!;
+    const selected = selectEvidenceForAction(content, matched.id);
+    evidenceIds = selected.evidenceIds;
 
-    if (matched) {
-      const selected = selectEvidenceForAction(content, matched.id);
-      evidenceIds = selected.evidenceIds;
-      const revealed = [...new Set([...parseRevealedEvidenceIds(attempt.revealedEvidenceIds), ...evidenceIds])];
+    const revealed = [
+      ...new Set([...parseRevealedEvidenceIds(attempt.revealedEvidenceIds), ...evidenceIds]),
+    ];
+    await prisma.attempt.update({
+      where: { id: attemptId },
+      data: { revealedEvidenceIds: revealed },
+    });
+
+    const format = inferEvidenceFormat(matched.category, matched.label);
+    if (format === "dialogue") {
+      const turnRecord: TurnStructuredRecord = {
+        candidateMessageId: userMessage.id,
+        classificationDecision: validated.decision,
+        targetSystem: classification.targetSystem,
+        methodOrTool: classification.methodOrTool,
+        requestedAction: classification.requestedAction,
+        parameters: classification.parameters,
+        matchedActionId: validated.approvedActionId,
+        missingFields: classification.missingFields,
+        responseType,
+        evidenceIds,
+        classifierModel: modelLabel,
+        responderModel: modelLabel,
+      };
+
       await prisma.attempt.update({
         where: { id: attemptId },
-        data: { revealedEvidenceIds: revealed },
+        data: {
+          classifierModel: modelLabel,
+          responderModel: modelLabel,
+          modelCallsCount: { increment: 2 },
+        },
       });
-      streamResponse = streamFormattedResponse(
+      await prisma.attemptEvent.create({
+        data: { attemptId, type: "turn_classified", payload: turnRecord as object },
+      });
+
+      const result = streamText({
         model,
-        selected.evidence,
-        classification.targetSystem,
-        matched.label,
-      );
-    } else {
-      responseText = "That action is not available in this environment.";
+        prompt: `Format an end-user dialogue using ONLY these approved facts. No suggestions. No next steps.
+
+Approved facts:
+"""
+${selected.evidence}
+"""
+
+Candidate request: ${message.trim()}`,
+        onFinish: async ({ text: finished }) => {
+          const validatedOut = validateDialogueOutput(finished, selected.evidence);
+          await persistAssistantOnce(attemptId, validatedOut.text, {
+            responseType,
+            matchedActionId: matched.id,
+          });
+        },
+      });
+
+      return result.toDataStreamResponse();
     }
-  } else if (classification.decision === "REFERENCE_QUESTION") {
+
+    responseText = formatDeterministicEvidence(
+      selected.evidence,
+      format,
+      classification.targetSystem,
+    );
+  } else if (validated.decision === "REFERENCE_QUESTION") {
     responseText = await formatReferenceResponse(model, message.trim());
+  } else if (validated.clarification) {
+    responseText = validated.clarification;
+  } else if (validated.decision === "DELEGATION_REQUEST") {
+    responseText = DELEGATION_REFUSAL;
+  } else if (validated.decision === "ANSWER_SEEKING") {
+    responseText = ANSWER_SEEKING_REFUSAL;
+  } else if (validated.decision === "META_OR_PROMPT_ATTACK") {
+    responseText = PROMPT_ATTACK_REFUSAL;
   } else {
-    responseText = buildStaticResponse(classification);
+    responseText = buildStaticResponse({ ...classification, decision: validated.decision });
+  }
+
+  if (validated.validationFailed) {
+    await prisma.attemptEvent.create({
+      data: {
+        attemptId,
+        type: "action_validation_failed",
+        payload: {
+          candidateMessageId: userMessage.id,
+          reason: validated.validationReason,
+          classifierDecision: rawClassification.decision,
+          matchedActionId: rawClassification.matchedActionId,
+        },
+      },
+    });
   }
 
   const turnRecord: TurnStructuredRecord = {
     candidateMessageId: userMessage.id,
-    classificationDecision: classification.decision,
+    classificationDecision: validated.decision,
     targetSystem: classification.targetSystem,
     methodOrTool: classification.methodOrTool,
     requestedAction: classification.requestedAction,
     parameters: classification.parameters,
-    matchedActionId: classification.matchedActionId,
+    matchedActionId: validated.approvedActionId,
     missingFields: classification.missingFields,
     responseType,
     evidenceIds,
@@ -265,7 +435,7 @@ export async function POST(
     data: {
       classifierModel: modelLabel,
       responderModel: modelLabel,
-      modelCallsCount: { increment: classification.decision === "VALID_ACTION" ? 2 : 1 },
+      modelCallsCount: { increment: 1 },
     },
   });
 
@@ -277,60 +447,16 @@ export async function POST(
     },
   });
 
-  if (streamResponse) {
-    const originalBody = streamResponse.body;
-    if (!originalBody) return streamResponse;
+  await recordPolicyViolationIfNeeded(attemptId, userMessage.id, validated.decision);
 
-    const reader = originalBody.getReader();
-    const decoder = new TextDecoder();
-    let fullText = "";
-
-    const stream = new ReadableStream({
-      async start(controller) {
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            controller.enqueue(value);
-            const chunk = decoder.decode(value, { stream: true });
-            for (const line of chunk.split("\n")) {
-              if (line.startsWith("0:")) {
-                try {
-                  fullText += JSON.parse(line.slice(2));
-                } catch {
-                  // partial chunk handled by client
-                }
-              }
-            }
-          }
-          if (fullText.trim()) {
-            await prisma.attemptMessage.create({
-              data: { attemptId, role: "assistant", content: fullText.trim() },
-            });
-          }
-          controller.close();
-        } catch (err) {
-          controller.error(err);
-        }
-      },
-    });
-
-    return new Response(stream, {
-      headers: streamResponse.headers,
-    });
+  if (!responseText) {
+    responseText = "That action is not available in this environment.";
   }
 
-  if (responseText) {
-    await prisma.attemptMessage.create({
-      data: {
-        attemptId,
-        role: "assistant",
-        content: responseText,
-        metadata: { responseType, classificationDecision: classification.decision },
-      },
-    });
-    return createPolicyViolationStreamResponse(responseText);
-  }
+  await persistAssistantOnce(attemptId, responseText, {
+    responseType,
+    classificationDecision: validated.decision,
+  });
 
-  return new Response("Unable to process request", { status: 500 });
+  return createPolicyViolationStreamResponse(responseText);
 }
