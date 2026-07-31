@@ -1,6 +1,37 @@
 import { describe, expect, it } from "vitest";
-import { validateClassifiedAction } from "@/lib/ai/validate-action";
+import {
+  canonicalMethod,
+  enrichClassificationForValidation,
+  inferCommunicationMethod,
+  matchesAllowedMethod,
+  validateClassifiedAction,
+} from "@/lib/ai/validate-action";
 import { getDefaultTemplateContent, validateTemplateContent } from "@/lib/templates/schema";
+
+function callUserContent() {
+  return {
+    ...getDefaultTemplateContent("DNS"),
+    actions: [
+      {
+        id: "call-user",
+        label: "Call user",
+        triggers: ["call", "ask", "client"],
+        result: "Selina summarizes the issue in her own words.",
+        category: "communication" as const,
+        requirements: {
+          targetType: "person" as const,
+          requireTarget: true,
+          requireMethodOrTool: true,
+          requiredParameters: [],
+          allowedTargets: ["Selina Kyle", "Selina", "client", "user", "ticket user"],
+          allowedMethods: ["call", "phone", "ask", "talk"],
+          requirementsReviewed: true,
+          intentionallyUnrestricted: false,
+        },
+      },
+    ],
+  };
+}
 
 const content = {
   ...getDefaultTemplateContent("DNS"),
@@ -257,28 +288,7 @@ describe("validateClassifiedAction", () => {
   });
 
   it("asks who to contact for communication actions missing a person target", () => {
-    const callContent = {
-      ...content,
-      actions: [
-        {
-          id: "call-user",
-          label: "Call user",
-          triggers: ["call", "ask"],
-          result: "Selina summarizes the issue.",
-          category: "communication" as const,
-          requirements: {
-            targetType: "person" as const,
-            requireTarget: true,
-            requireMethodOrTool: true,
-            requiredParameters: [],
-            allowedTargets: ["Selina Kyle", "Selina", "client", "user"],
-            allowedMethods: ["call", "phone", "ask", "talk"],
-            requirementsReviewed: true,
-            intentionallyUnrestricted: false,
-          },
-        },
-      ],
-    };
+    const callContent = callUserContent();
 
     const result = validateClassifiedAction(
       callContent,
@@ -303,31 +313,8 @@ describe("validateClassifiedAction", () => {
   });
 
   it("approves communication actions when person and method are present", () => {
-    const callContent = {
-      ...content,
-      actions: [
-        {
-          id: "call-user",
-          label: "Call user",
-          triggers: ["call", "ask"],
-          result: "Selina summarizes the issue.",
-          category: "communication" as const,
-          requirements: {
-            targetType: "person" as const,
-            requireTarget: true,
-            requireMethodOrTool: true,
-            requiredParameters: [],
-            allowedTargets: ["Selina Kyle", "Selina", "client", "user"],
-            allowedMethods: ["call", "phone", "ask", "talk"],
-            requirementsReviewed: true,
-            intentionallyUnrestricted: false,
-          },
-        },
-      ],
-    };
-
     const result = validateClassifiedAction(
-      callContent,
+      callUserContent(),
       {
         decision: "VALID_ACTION",
         targetType: "person",
@@ -344,6 +331,84 @@ describe("validateClassifiedAction", () => {
 
     expect(result.validationFailed).toBe(false);
     expect(result.approvedActionId).toBe("call-user");
+  });
+
+  it("deterministically accepts Call the client and ask for a summary in her own words", () => {
+    const message = "Call the client and ask for a summary in her own words.";
+    const result = validateClassifiedAction(
+      callUserContent(),
+      {
+        decision: "INCOMPLETE_ACTION",
+        targetType: "person",
+        matchedActionId: null,
+        target: "client",
+        methodOrTool: null,
+        requestedAction: "ask for summary",
+        parameters: {},
+        missingFields: ["methodOrTool", "target details"],
+        reasoning: "model missed the obvious call verb",
+      },
+      message,
+    );
+
+    expect(inferCommunicationMethod(message)).toBe("call");
+    expect(result.validationFailed).toBe(false);
+    expect(result.decision).toBe("VALID_ACTION");
+    expect(result.approvedActionId).toBe("call-user");
+    expect(result.classification.methodOrTool).toBe("call");
+    expect(result.classification.target).toBe("client");
+    expect(result.classification.missingFields).toEqual([]);
+    expect(result.clarification).toBeNull();
+  });
+
+  it("does not ask which command or tool when call is already present", () => {
+    const message = "call the client and ask for summary in her own words";
+    const enriched = enrichClassificationForValidation(
+      callUserContent(),
+      {
+        decision: "INCOMPLETE_ACTION",
+        targetType: "person",
+        matchedActionId: "call-user",
+        target: "client",
+        methodOrTool: "call",
+        requestedAction: "ask for summary",
+        parameters: { summary: "in her own words" },
+        missingFields: ["target details"],
+        reasoning: "model noise",
+      },
+      message,
+    );
+
+    expect(enriched.classification.missingFields).toEqual([]);
+    expect(enriched.classification.methodOrTool).toBe("call");
+    expect(enriched.classification.decision).toBe("VALID_ACTION");
+
+    const result = validateClassifiedAction(
+      callUserContent(),
+      {
+        decision: "INCOMPLETE_ACTION",
+        targetType: "person",
+        matchedActionId: "call-user",
+        target: "client",
+        methodOrTool: "call",
+        requestedAction: "ask for summary",
+        parameters: {},
+        missingFields: ["target details"],
+        reasoning: "model noise",
+      },
+      message,
+    );
+    expect(result.approvedActionId).toBe("call-user");
+    expect(result.clarification).not.toBe("Which command or tool are you using?");
+    expect(result.clarification).not.toBe("How do you want to contact them?");
+  });
+
+  it("matches communication methods symmetrically via canonical forms", () => {
+    expect(canonicalMethod("phone")).toBe("call");
+    expect(canonicalMethod("ask")).toBe("contact");
+    expect(matchesAllowedMethod("phone", ["call"])).toBe(true);
+    expect(matchesAllowedMethod("call", ["phone", "ask"])).toBe(true);
+    expect(matchesAllowedMethod("ask", ["call", "talk"])).toBe(true);
   });
 
   it("maps legacy requireTargetSystem onto requireTarget", () => {

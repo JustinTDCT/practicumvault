@@ -1,4 +1,5 @@
 import { IntentClassification, ClassificationDecision } from "@/lib/ai/types";
+import { deriveClarificationQuestion, findMatchingAction } from "@/lib/ai/classifier";
 import {
   ActionDefinition,
   ActionTargetType,
@@ -6,7 +7,6 @@ import {
   getDefaultActionRequirements,
   resolveActionTargetType,
 } from "@/lib/templates/schema";
-import { deriveClarificationQuestion } from "@/lib/ai/classifier";
 
 export interface ValidatedActionDecision {
   decision: ClassificationDecision;
@@ -44,8 +44,43 @@ const METHOD_ALIASES: Record<string, string[]> = {
   ipconfig: ["ipconfig"],
   powershell: ["powershell", "pwsh"],
   rdp: ["rdp", "remote desktop", "mstsc", "remote"],
-  call: ["call", "phone", "ask", "talk"],
 };
+
+const COMMUNICATION_METHOD_VARIANTS: Record<string, string[]> = {
+  call: ["call", "phone", "telephone", "ring"],
+  email: ["email", "e-mail"],
+  message: ["chat", "message", "teams", "slack"],
+  contact: ["ask", "talk", "speak", "contact"],
+};
+
+export function inferCommunicationMethod(message: string): string | null {
+  if (/\b(call|phone|telephone|ring)\b/i.test(message)) {
+    return "call";
+  }
+  if (/\b(email|e-mail)\b/i.test(message)) {
+    return "email";
+  }
+  if (/\b(chat|message|teams|slack)\b/i.test(message)) {
+    return "message";
+  }
+  if (/\b(ask|talk|speak|contact)\b/i.test(message)) {
+    return "contact";
+  }
+  return null;
+}
+
+export function canonicalMethod(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  for (const [canonical, variants] of Object.entries(COMMUNICATION_METHOD_VARIANTS)) {
+    if (variants.includes(normalized)) return canonical;
+  }
+  return normalized;
+}
+
+export function matchesAllowedMethod(actual: string, allowed: string[]): boolean {
+  const canonicalActual = canonicalMethod(actual);
+  return allowed.some((entry) => canonicalMethod(entry) === canonicalActual);
+}
 
 function normalize(value: string | null | undefined): string {
   return (value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
@@ -80,6 +115,12 @@ function messageContainsValue(message: string, value: string): boolean {
   return tokens.has(v) || v.split(" ").every((part) => tokens.has(part));
 }
 
+function methodPresentInMessage(message: string, method: string): boolean {
+  const canonical = canonicalMethod(method);
+  const variants = COMMUNICATION_METHOD_VARIANTS[canonical] ?? [canonical];
+  return variants.some((variant) => messageContainsValue(message, variant));
+}
+
 function matchesAllowed(value: string, allowed: string[], aliases?: Record<string, string[]>): boolean {
   const n = normalize(value);
   for (const entry of allowed) {
@@ -95,11 +136,12 @@ function matchesAllowed(value: string, allowed: string[], aliases?: Record<strin
 
 function hasNegatedMethod(message: string, method: string): boolean {
   const msg = normalize(message);
-  const m = normalize(method);
-  return (
-    new RegExp(`\\b(don'?t|do not|without|not)\\b[^.?]{0,40}\\b${m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(
-      msg,
-    )
+  const variants = COMMUNICATION_METHOD_VARIANTS[canonicalMethod(method)] ?? [normalize(method)];
+  return variants.some((m) =>
+    new RegExp(
+      `\\b(don'?t|do not|without|not)\\b[^.?]{0,40}\\b${m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`,
+      "i",
+    ).test(msg),
   );
 }
 
@@ -134,6 +176,120 @@ function resolveAction(
   return content.actions.find((a) => a.id === classification.matchedActionId) ?? null;
 }
 
+function normalizeMissingFieldName(field: string): string | null {
+  const n = field.trim().toLowerCase();
+  if (!n) return null;
+  if (
+    n === "target" ||
+    n === "targetsystem" ||
+    n.includes("target") ||
+    n === "who" ||
+    n === "person" ||
+    n === "contact"
+  ) {
+    return "target";
+  }
+  if (n === "methodortool" || n.includes("method") || n.includes("tool") || n === "how") {
+    return "methodOrTool";
+  }
+  if (n === "objectorparameters" || n === "object" || n === "parameters") return "objectOrParameters";
+  if (n === "log" || n === "setting" || n === "requestedaction") {
+    return n === "requestedaction" ? "requestedAction" : n;
+  }
+  // Drop model-invented noise that is not part of the validation contract.
+  return null;
+}
+
+function normalizeMissingFields(
+  fields: string[],
+  classification: IntentClassification,
+): string[] {
+  const normalized = fields
+    .map(normalizeMissingFieldName)
+    .filter((field): field is string => field != null);
+
+  return [...new Set(normalized)].filter((field) => {
+    if (field === "target" && isMeaningfulValue(classification.target)) return false;
+    if (field === "methodOrTool" && isMeaningfulValue(classification.methodOrTool)) return false;
+    if (field === "requestedAction" && isMeaningfulValue(classification.requestedAction)) return false;
+    return true;
+  });
+}
+
+function inferTargetFromAllowed(message: string, allowedTargets: string[]): string | null {
+  for (const allowed of allowedTargets) {
+    if (messageContainsValue(message, allowed)) return allowed;
+  }
+  return null;
+}
+
+/**
+ * Deterministic communication enrichment before the server-side gate.
+ * Does not trust the model to notice an obvious contact verb.
+ */
+export function enrichClassificationForValidation(
+  content: ScenarioTemplateContent,
+  classification: IntentClassification,
+  candidateMessage: string,
+): { classification: IntentClassification; action: ActionDefinition | null } {
+  const enriched: IntentClassification = {
+    ...classification,
+    missingFields: [...classification.missingFields],
+  };
+
+  let action = resolveAction(content, enriched);
+  if (!action && candidateMessage) {
+    const matchedId = findMatchingAction(content, candidateMessage);
+    if (matchedId) {
+      enriched.matchedActionId = matchedId;
+      action = content.actions.find((a) => a.id === matchedId) ?? null;
+    }
+  }
+
+  const isCommunication =
+    action?.category === "communication" || enriched.targetType === "person";
+
+  if (isCommunication && candidateMessage) {
+    if (!isMeaningfulValue(enriched.methodOrTool)) {
+      const inferredMethod = inferCommunicationMethod(candidateMessage);
+      if (inferredMethod) {
+        enriched.methodOrTool = inferredMethod;
+      }
+    } else {
+      enriched.methodOrTool = canonicalMethod(enriched.methodOrTool!);
+    }
+
+    if (!isMeaningfulValue(enriched.target) && action) {
+      const inferredTarget = inferTargetFromAllowed(
+        candidateMessage,
+        requirementsFor(action).allowedTargets,
+      );
+      if (inferredTarget) {
+        enriched.target = inferredTarget;
+      }
+    }
+
+    if (!enriched.targetType) {
+      enriched.targetType = action ? resolveActionTargetType(action) : "person";
+    }
+  }
+
+  enriched.missingFields = normalizeMissingFields(enriched.missingFields, enriched);
+
+  if (
+    enriched.decision !== "VALID_ACTION" &&
+    action?.category === "communication" &&
+    enriched.matchedActionId &&
+    enriched.missingFields.length === 0 &&
+    isMeaningfulValue(enriched.methodOrTool) &&
+    (!requirementsFor(action).requireTarget || isMeaningfulValue(enriched.target))
+  ) {
+    enriched.decision = "VALID_ACTION";
+  }
+
+  return { classification: enriched, action };
+}
+
 /**
  * Server-side gate: AI classification is advisory only.
  * Evidence may be selected only when this returns an approved action ID.
@@ -143,21 +299,25 @@ export function validateClassifiedAction(
   classification: IntentClassification,
   candidateMessage = "",
 ): ValidatedActionDecision {
-  const base = { classification, clarification: null as string | null };
-  const hintedAction = resolveAction(content, classification);
+  const { classification: enriched, action: hintedAction } = enrichClassificationForValidation(
+    content,
+    classification,
+    candidateMessage,
+  );
+  const base = { classification: enriched, clarification: null as string | null };
 
-  if (classification.decision !== "VALID_ACTION") {
+  if (enriched.decision !== "VALID_ACTION") {
     return {
       ...base,
-      decision: classification.decision,
+      decision: enriched.decision,
       approvedActionId: null,
       validationFailed: false,
       validationReason: null,
       clarification:
-        classification.decision === "AMBIGUOUS_ACTION" ||
-        classification.decision === "INCOMPLETE_ACTION" ||
-        classification.decision === "MULTIPLE_ACTIONS"
-          ? clarificationFor(classification, candidateMessage, hintedAction)
+        enriched.decision === "AMBIGUOUS_ACTION" ||
+        enriched.decision === "INCOMPLETE_ACTION" ||
+        enriched.decision === "MULTIPLE_ACTIONS"
+          ? clarificationFor(enriched, candidateMessage, hintedAction)
           : null,
     };
   }
@@ -173,18 +333,18 @@ export function validateClassifiedAction(
     };
   }
 
-  if (classification.missingFields.length > 0) {
+  if (enriched.missingFields.length > 0) {
     return {
       ...base,
       decision: "INCOMPLETE_ACTION",
       approvedActionId: null,
       validationFailed: true,
       validationReason: "missing_fields",
-      clarification: clarificationFor(classification, candidateMessage, hintedAction),
+      clarification: clarificationFor(enriched, candidateMessage, hintedAction),
     };
   }
 
-  const actionId = classification.matchedActionId;
+  const actionId = enriched.matchedActionId;
   if (!actionId) {
     return {
       ...base,
@@ -210,6 +370,7 @@ export function validateClassifiedAction(
 
   const requirements = requirementsFor(action);
   const targetType = resolveActionTargetType(action);
+  const isCommunication = action.category === "communication";
 
   // Legacy / unreviewed actions cannot unlock evidence via classifier alone
   if (!requirements.requirementsReviewed) {
@@ -221,7 +382,7 @@ export function validateClassifiedAction(
       validationReason: "requirements_unreviewed",
       clarification: clarificationFor(
         {
-          ...classification,
+          ...enriched,
           decision: "INCOMPLETE_ACTION",
           missingFields: ["methodOrTool"],
           targetType,
@@ -236,31 +397,30 @@ export function validateClassifiedAction(
 
   if (!requirements.intentionallyUnrestricted) {
     if (requirements.requireTarget && targetType !== "none") {
-      if (!isMeaningfulValue(classification.target)) {
+      if (!isMeaningfulValue(enriched.target)) {
         missing.push("target");
-      } else if (candidateMessage && !messageContainsValue(candidateMessage, classification.target!)) {
+      } else if (candidateMessage && !messageContainsValue(candidateMessage, enriched.target!)) {
         missing.push("target");
       }
     }
 
     if (requirements.requireMethodOrTool) {
-      if (!isMeaningfulValue(classification.methodOrTool)) {
+      if (!isMeaningfulValue(enriched.methodOrTool)) {
         missing.push("methodOrTool");
-      } else if (
-        candidateMessage &&
-        !messageContainsValue(candidateMessage, classification.methodOrTool!)
-      ) {
-        missing.push("methodOrTool");
-      } else if (
-        classification.methodOrTool &&
-        hasNegatedMethod(candidateMessage, classification.methodOrTool)
-      ) {
-        missing.push("methodOrTool");
+      } else if (candidateMessage) {
+        const present = isCommunication
+          ? methodPresentInMessage(candidateMessage, enriched.methodOrTool!)
+          : messageContainsValue(candidateMessage, enriched.methodOrTool!);
+        if (!present) {
+          missing.push("methodOrTool");
+        } else if (hasNegatedMethod(candidateMessage, enriched.methodOrTool!)) {
+          missing.push("methodOrTool");
+        }
       }
     }
 
     for (const param of requirements.requiredParameters) {
-      const value = classification.parameters[param];
+      const value = enriched.parameters[param];
       if (!isMeaningfulValue(value)) {
         missing.push(param);
       } else if (candidateMessage && !messageContainsValue(candidateMessage, value)) {
@@ -269,15 +429,17 @@ export function validateClassifiedAction(
     }
 
     if (requirements.allowedTargets.length > 0) {
-      if (!classification.target || !matchesAllowed(classification.target, requirements.allowedTargets)) {
+      if (!enriched.target || !matchesAllowed(enriched.target, requirements.allowedTargets)) {
         missing.push("target");
       }
     }
 
     if (requirements.allowedMethods.length > 0) {
       if (
-        !classification.methodOrTool ||
-        !matchesAllowed(classification.methodOrTool, requirements.allowedMethods, METHOD_ALIASES)
+        !enriched.methodOrTool ||
+        !(isCommunication
+          ? matchesAllowedMethod(enriched.methodOrTool, requirements.allowedMethods)
+          : matchesAllowed(enriched.methodOrTool, requirements.allowedMethods, METHOD_ALIASES))
       ) {
         missing.push("methodOrTool");
       }
@@ -286,7 +448,7 @@ export function validateClassifiedAction(
 
   if (missing.length > 0) {
     const adjusted: IntentClassification = {
-      ...classification,
+      ...enriched,
       decision: "INCOMPLETE_ACTION",
       targetType,
       missingFields: [...new Set(missing)],
@@ -303,7 +465,7 @@ export function validateClassifiedAction(
   }
 
   return {
-    ...base,
+    classification: enriched,
     decision: "VALID_ACTION",
     approvedActionId: action.id,
     validationFailed: false,

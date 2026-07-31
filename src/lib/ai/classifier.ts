@@ -215,7 +215,9 @@ export function deriveClarificationQuestion(
   if (classification.decision === "MULTIPLE_ACTIONS") {
     return "Which action do you want to perform first?";
   }
-  return "Which command or tool are you using?";
+  // Avoid asking for a tool/method when one is already present or unspecified.
+  if (targetType === "person") return "Who do you want to contact?";
+  return "Which system do you want to run that on?";
 }
 
 export async function classifyCandidateIntent(
